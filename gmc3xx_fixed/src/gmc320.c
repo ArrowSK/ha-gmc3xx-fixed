@@ -1,17 +1,13 @@
 /*
  * GMC3xx serial reader for Home Assistant.
  *
- * This file is derived from gi1mic/gmc320 (GPL-3.0), which in turn notes
- * that parts were based on code by Christoph Haas.
+ * Derived from gi1mic/gmc320 (GPL-3.0), which in turn notes that parts were
+ * based on code by Christoph Haas.
  *
- * Modified 2026 for robust RFC1201-family serial framing and compatibility:
- *   - flush stale input before every request;
- *   - read the exact documented response length, tolerating fragmented reads;
- *   - retry incomplete transactions instead of decoding partial/stale bytes;
- *   - auto-detect the documented legacy serial baud rates;
- *   - avoid sending GMC-320-only diagnostic commands to GMC-280/300-family units;
- *   - keep legacy serial formatting for MQTT topic compatibility;
- *   - separate identity reads from recurring sample reads.
+ * This version keeps the RFC1201 compatibility path while making serial
+ * framing explicit: exact-length reads, stale-input draining, bounded retries,
+ * model-aware optional commands, one persistent serial connection per run,
+ * and fail-closed behavior when a response cannot be completed.
  *
  * SPDX-License-Identifier: GPL-3.0-only
  */
@@ -34,6 +30,7 @@
 #define GMC_IDENTIFY_TIMEOUT_MS 900
 #define GMC_RETRIES 3
 #define GMC_INTER_COMMAND_US 25000
+#define GMC_HEARTBEAT_SETTLE_US 500000
 
 struct baud_entry {
     int rate;
@@ -55,6 +52,25 @@ static const struct baud_entry BAUDS[] = {
 #ifdef B28800
     {28800, B28800},
 #endif
+};
+
+struct identity {
+    char version[32];
+    char serial_compat[32];
+    char serial_full[32];
+    int baud;
+    bool has_320_diagnostics;
+};
+
+struct sample {
+    uint16_t cpm;
+    double volt;
+    bool has_temp;
+    double temp;
+    bool has_gyro;
+    uint16_t x;
+    uint16_t y;
+    uint16_t z;
 };
 
 static long long monotonic_ms(void) {
@@ -103,11 +119,11 @@ static int write_all(int fd, const uint8_t *buf, size_t len) {
 
 static int read_exact(int fd, uint8_t *buf, size_t len, int timeout_ms) {
     size_t off = 0;
-    long long deadline = monotonic_ms() + timeout_ms;
+    const long long deadline = monotonic_ms() + timeout_ms;
 
     while (off < len) {
-        long long now = monotonic_ms();
-        int remaining = (int)(deadline - now);
+        const long long now = monotonic_ms();
+        const int remaining = (int)(deadline - now);
         if (remaining <= 0) {
             break;
         }
@@ -220,11 +236,12 @@ static int send_no_response(int fd, const char *cmd) {
     if (tcdrain(fd) != 0) {
         return -1;
     }
-    /* Match the effective quiet period of the upstream VTIME=5 drain.
-     * GMC-300-series firmware can ignore the first polling command if it
-     * follows HEARTBEAT0 too quickly. Wait 500 ms, then discard any bytes
-     * that were already in flight before starting a framed transaction. */
-    usleep(500000);
+
+    /* GMC-300-series firmware can ignore the first polling command when it
+     * follows HEARTBEAT0 too quickly. The older reader effectively waited for
+     * a 500 ms read timeout here; keep the same quiet period and then discard
+     * bytes that were already in flight. */
+    usleep(GMC_HEARTBEAT_SETTLE_US);
     return flush_input(fd);
 }
 
@@ -237,7 +254,7 @@ static int open_serial(const char *device, int baud_rate) {
 
     int fd = open(device, O_RDWR | O_NOCTTY);
     if (fd < 0) {
-        fprintf(stderr, "serial: cannot open %s: %s\n", device, strerror(errno));
+        fprintf(stderr, "serial: cannot open device: %s\n", strerror(errno));
         return -1;
     }
 
@@ -274,8 +291,6 @@ static int open_serial(const char *device, int baud_rate) {
         return -1;
     }
 
-    /* RFC1201-family units can emit heartbeat bytes asynchronously. Disable
-     * heartbeat before polling so unsolicited data cannot cross a transaction. */
     if (send_no_response(fd, "<HEARTBEAT0>>") != 0) {
         close(fd);
         return -1;
@@ -309,12 +324,8 @@ static void json_print_string(const char *s) {
 static void sanitize_ascii(char *dst, size_t dst_len, const uint8_t *src, size_t src_len) {
     size_t out = 0;
     for (size_t i = 0; i < src_len && out + 1 < dst_len; ++i) {
-        unsigned char ch = src[i];
-        if (ch >= 0x20 && ch <= 0x7e) {
-            dst[out++] = (char)ch;
-        } else {
-            dst[out++] = '?';
-        }
+        const unsigned char ch = src[i];
+        dst[out++] = (ch >= 0x20 && ch <= 0x7e) ? (char)ch : '?';
     }
     dst[out] = '\0';
 }
@@ -331,8 +342,8 @@ static void format_serial_compat(char *dst, size_t dst_len, const uint8_t raw[7]
     size_t used = 0;
     dst[0] = '\0';
 
-    /* Preserve the original add-on's non-zero-padded %x formatting because
-     * existing Home Assistant MQTT topics may depend on this exact string. */
+    /* Keep the old non-zero-padded %x formatting because existing Home
+     * Assistant MQTT topics may depend on this exact identifier. */
     for (size_t i = 0; i < 7; ++i) {
         if (used >= dst_len) {
             break;
@@ -365,10 +376,7 @@ static uint16_t decode_be16(const uint8_t bytes[2]) {
     return (uint16_t)(((uint16_t)bytes[0] << 8) | bytes[1]);
 }
 
-static int get_identity_on_fd(int fd, char *version, size_t version_len,
-                              char *serial_compat, size_t serial_compat_len,
-                              char *serial_full, size_t serial_full_len,
-                              bool quick) {
+static int get_identity_on_fd(int fd, struct identity *identity, bool quick) {
     uint8_t ver_raw[14];
     uint8_t serial_raw[7];
     int rc;
@@ -383,8 +391,8 @@ static int get_identity_on_fd(int fd, char *version, size_t version_len,
         return -1;
     }
 
-    sanitize_ascii(version, version_len, ver_raw, sizeof(ver_raw));
-    if (!valid_rfc1201_version(version)) {
+    sanitize_ascii(identity->version, sizeof(identity->version), ver_raw, sizeof(ver_raw));
+    if (!valid_rfc1201_version(identity->version)) {
         return -1;
     }
 
@@ -392,10 +400,11 @@ static int get_identity_on_fd(int fd, char *version, size_t version_len,
         return -1;
     }
 
-    format_serial_compat(serial_compat, serial_compat_len, serial_raw);
-    format_serial_full(serial_full, serial_full_len, serial_raw);
+    format_serial_compat(identity->serial_compat, sizeof(identity->serial_compat), serial_raw);
+    format_serial_full(identity->serial_full, sizeof(identity->serial_full), serial_raw);
+    identity->has_320_diagnostics = model_has_320_diagnostics(identity->version);
 
-    if (serial_compat[0] == '\0' || serial_full[0] == '\0') {
+    if (identity->serial_compat[0] == '\0' || identity->serial_full[0] == '\0') {
         fprintf(stderr, "serial: invalid empty identity response\n");
         return -1;
     }
@@ -403,10 +412,9 @@ static int get_identity_on_fd(int fd, char *version, size_t version_len,
 }
 
 static int identify_device(const char *device, const char *baud_spec,
-                           int *fd_out, int *baud_out,
-                           char *version, size_t version_len,
-                           char *serial_compat, size_t serial_compat_len,
-                           char *serial_full, size_t serial_full_len) {
+                           int *fd_out, struct identity *identity) {
+    memset(identity, 0, sizeof(*identity));
+
     if (strcmp(baud_spec, "auto") != 0) {
         int requested = 0;
         if (parse_positive_int(baud_spec, &requested) != 0 || find_baud(requested) == NULL) {
@@ -417,14 +425,12 @@ static int identify_device(const char *device, const char *baud_spec,
         if (fd < 0) {
             return -1;
         }
-        if (get_identity_on_fd(fd, version, version_len, serial_compat,
-                               serial_compat_len, serial_full, serial_full_len,
-                               false) != 0) {
+        if (get_identity_on_fd(fd, identity, false) != 0) {
             close(fd);
             return -1;
         }
+        identity->baud = requested;
         *fd_out = fd;
-        *baud_out = requested;
         return 0;
     }
 
@@ -433,30 +439,18 @@ static int identify_device(const char *device, const char *baud_spec,
         if (fd < 0) {
             continue;
         }
-        if (get_identity_on_fd(fd, version, version_len, serial_compat,
-                               serial_compat_len, serial_full, serial_full_len,
-                               true) == 0) {
+        if (get_identity_on_fd(fd, identity, true) == 0) {
+            identity->baud = BAUDS[i].rate;
             *fd_out = fd;
-            *baud_out = BAUDS[i].rate;
             return 0;
         }
         close(fd);
+        memset(identity, 0, sizeof(*identity));
     }
 
     fprintf(stderr, "serial: no RFC1201-compatible GMC identity found at supported baud rates\n");
     return -1;
 }
-
-struct sample {
-    uint16_t cpm;
-    double volt;
-    bool has_temp;
-    double temp;
-    bool has_gyro;
-    uint16_t x;
-    uint16_t y;
-    uint16_t z;
-};
 
 static int get_sample(int fd, bool enable_320_diagnostics, struct sample *out) {
     uint8_t cpm_raw[2];
@@ -512,47 +506,127 @@ static int get_sample(int fd, bool enable_320_diagnostics, struct sample *out) {
     return 0;
 }
 
-static void print_identity_json(const char *version, const char *serial_compat,
-                                const char *serial_full, int baud,
-                                bool has_320_diagnostics) {
-    fputs("{\"version\":", stdout);
-    json_print_string(version);
+static void print_identity_json(const struct identity *identity, bool typed) {
+    if (typed) {
+        fputs("{\"type\":\"identity\",\"version\":", stdout);
+    } else {
+        fputs("{\"version\":", stdout);
+    }
+    json_print_string(identity->version);
     fputs(",\"serial\":", stdout);
-    json_print_string(serial_compat);
+    json_print_string(identity->serial_compat);
     fputs(",\"serial_full\":", stdout);
-    json_print_string(serial_full);
+    json_print_string(identity->serial_full);
     printf(",\"baud\":%d,\"has_temp\":%s,\"has_gyro\":%s}\n",
-           baud,
-           has_320_diagnostics ? "true" : "false",
-           has_320_diagnostics ? "true" : "false");
+           identity->baud,
+           identity->has_320_diagnostics ? "true" : "false",
+           identity->has_320_diagnostics ? "true" : "false");
 }
 
-static void print_sample_json(const struct sample *s) {
-    printf("{\"cpm\":%u,\"volt\":%.1f,\"temp\":", s->cpm, s->volt);
-    if (s->has_temp) {
-        printf("%.1f", s->temp);
+static void print_sample_json(const struct sample *sample) {
+    printf("{\"cpm\":%u,\"volt\":%.1f,\"temp\":", sample->cpm, sample->volt);
+    if (sample->has_temp) {
+        printf("%.1f", sample->temp);
     } else {
         fputs("null", stdout);
     }
     fputs(",\"x\":", stdout);
-    if (s->has_gyro) {
-        printf("%u", s->x);
+    if (sample->has_gyro) {
+        printf("%u", sample->x);
     } else {
         fputs("null", stdout);
     }
     fputs(",\"y\":", stdout);
-    if (s->has_gyro) {
-        printf("%u", s->y);
+    if (sample->has_gyro) {
+        printf("%u", sample->y);
     } else {
         fputs("null", stdout);
     }
     fputs(",\"z\":", stdout);
-    if (s->has_gyro) {
-        printf("%u", s->z);
+    if (sample->has_gyro) {
+        printf("%u", sample->z);
     } else {
         fputs("null", stdout);
     }
     fputs("}\n", stdout);
+}
+
+static void print_stream_sample_json(const struct identity *identity,
+                                     const struct sample *sample) {
+    fputs("{\"type\":\"sample\",\"version\":", stdout);
+    json_print_string(identity->version);
+    fputs(",\"serial\":", stdout);
+    json_print_string(identity->serial_compat);
+    fputs(",\"serial_full\":", stdout);
+    json_print_string(identity->serial_full);
+    printf(",\"baud\":%d,\"cpm\":%u,\"volt\":%.1f,\"temp\":",
+           identity->baud, sample->cpm, sample->volt);
+    if (sample->has_temp) {
+        printf("%.1f", sample->temp);
+    } else {
+        fputs("null", stdout);
+    }
+    fputs(",\"x\":", stdout);
+    if (sample->has_gyro) {
+        printf("%u", sample->x);
+    } else {
+        fputs("null", stdout);
+    }
+    fputs(",\"y\":", stdout);
+    if (sample->has_gyro) {
+        printf("%u", sample->y);
+    } else {
+        fputs("null", stdout);
+    }
+    fputs(",\"z\":", stdout);
+    if (sample->has_gyro) {
+        printf("%u", sample->z);
+    } else {
+        fputs("null", stdout);
+    }
+    fputs("}\n", stdout);
+}
+
+static int sleep_seconds(int seconds) {
+    struct timespec req = {
+        .tv_sec = seconds,
+        .tv_nsec = 0,
+    };
+    while (nanosleep(&req, &req) != 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int stream_device(const char *device, const char *baud_spec, int interval) {
+    int fd = -1;
+    struct identity identity;
+    if (identify_device(device, baud_spec, &fd, &identity) != 0) {
+        return 1;
+    }
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    print_identity_json(&identity, true);
+    fflush(stdout);
+
+    while (true) {
+        struct sample sample;
+        if (get_sample(fd, identity.has_320_diagnostics, &sample) != 0) {
+            close(fd);
+            return 1;
+        }
+        print_stream_sample_json(&identity, &sample);
+        fflush(stdout);
+
+        if (sleep_seconds(interval) != 0) {
+            fprintf(stderr, "serial: sleep failed: %s\n", strerror(errno));
+            close(fd);
+            return 1;
+        }
+    }
 }
 
 static void usage(const char *prog) {
@@ -560,60 +634,55 @@ static void usage(const char *prog) {
             "Usage:\n"
             "  %s --identify DEVICE BAUD|auto\n"
             "  %s --sample DEVICE BAUD DIAGNOSTICS\n"
+            "  %s --stream DEVICE BAUD|auto INTERVAL_SECONDS\n"
             "\n"
             "DIAGNOSTICS is 1 only for GMC-320-family RFC1201 units; otherwise 0.\n",
-            prog, prog);
+            prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "--identify") == 0) {
-        const char *device = argv[2];
-        const char *baud_spec = argv[3];
         int fd = -1;
-        int baud = 0;
-        char version[32] = {0};
-        char serial_compat[32] = {0};
-        char serial_full[32] = {0};
-
-        if (identify_device(device, baud_spec, &fd, &baud,
-                            version, sizeof(version),
-                            serial_compat, sizeof(serial_compat),
-                            serial_full, sizeof(serial_full)) != 0) {
+        struct identity identity;
+        if (identify_device(argv[2], argv[3], &fd, &identity) != 0) {
             return 1;
         }
-
-        bool has_320_diagnostics = model_has_320_diagnostics(version);
-        print_identity_json(version, serial_compat, serial_full, baud,
-                            has_320_diagnostics);
+        print_identity_json(&identity, false);
         close(fd);
         return 0;
     }
 
     if (argc == 5 && strcmp(argv[1], "--sample") == 0) {
-        const char *device = argv[2];
         int baud = 0;
-        int diagnostics = 0;
         if (parse_positive_int(argv[3], &baud) != 0 || find_baud(baud) == NULL) {
             fprintf(stderr, "serial: invalid/unsupported sample baud '%s'\n", argv[3]);
             return 2;
         }
-        if ((strcmp(argv[4], "0") != 0) && (strcmp(argv[4], "1") != 0)) {
+        if (strcmp(argv[4], "0") != 0 && strcmp(argv[4], "1") != 0) {
             fprintf(stderr, "serial: diagnostics flag must be 0 or 1\n");
             return 2;
         }
-        diagnostics = strcmp(argv[4], "1") == 0;
 
-        int fd = open_serial(device, baud);
+        int fd = open_serial(argv[2], baud);
         if (fd < 0) {
             return 1;
         }
         struct sample sample;
-        int rc = get_sample(fd, diagnostics != 0, &sample);
+        int rc = get_sample(fd, strcmp(argv[4], "1") == 0, &sample);
         if (rc == 0) {
             print_sample_json(&sample);
         }
         close(fd);
         return rc == 0 ? 0 : 1;
+    }
+
+    if (argc == 5 && strcmp(argv[1], "--stream") == 0) {
+        int interval = 0;
+        if (parse_positive_int(argv[4], &interval) != 0 || interval < 2 || interval > 3600) {
+            fprintf(stderr, "serial: stream interval must be between 2 and 3600 seconds\n");
+            return 2;
+        }
+        return stream_device(argv[2], argv[3], interval);
     }
 
     usage(argv[0]);

@@ -1,19 +1,19 @@
-# GMC3xx Fixed Radiation Monitor
+# GMC3xx Radiation Monitor
 
-Robust USB-serial to MQTT bridge for the legacy GQ **RFC1201** Geiger-counter family, including GMC-280/300/300E/300E Plus/320/320 Plus where the required protocol commands are supported.
+Reads supported GQ GMC-280/300/300E/300E Plus/320-family Geiger counters over USB and publishes their readings to MQTT.
 
-This app is a compatibility fork of [`gi1mic/gmc320`](https://github.com/gi1mic/gmc320). It fixes serial short-read/framing failures without applying an arbitrary upper limit to CPM values.
+The app is designed to be left alone once it is running:
 
-Highlights:
+- automatic serial-device discovery when `port` is `auto`;
+- automatic baud detection;
+- automatic Home Assistant MQTT service credentials when the MQTT server override is blank;
+- one persistent serial connection while readings are flowing;
+- automatic reconnect after USB/serial failure;
+- bounded exact-length serial reads, so incomplete replies are dropped rather than decoded as CPM;
+- no arbitrary upper CPM filter;
+- Supervisor watchdog support;
+- the historical serial-derived MQTT topic is kept for existing Home Assistant setups.
 
-- exact-length serial reads with retry and stale-input flushing;
-- automatic legacy baud detection, with optional forced baud;
-- 300/300E-safe core polling without unsupported 320-only diagnostic commands;
-- validated GMC-320 temperature/gyroscope replies;
-- MQTT publish timeout protection;
-- same legacy serial-derived MQTT topic for existing Home Assistant setups;
-- no detector identifiers or MQTT credentials written to normal logs.
+If you are replacing another GMC reader, stop the old reader before starting this one. Two programs must not use the same serial device at once.
 
-GMC-500/600-family RFC1801 devices and other four-byte-CPM protocols are intentionally not supported by this release.
-
-Read the **Documentation** tab before migrating. The old GMC reader must be stopped before this app starts because both cannot own the same serial device.
+Open the **Documentation** tab for the setup and migration guide.

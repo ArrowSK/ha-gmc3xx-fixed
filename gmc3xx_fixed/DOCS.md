@@ -1,74 +1,112 @@
-# GMC3xx Fixed Radiation Monitor — documentation
+# GMC3xx Radiation Monitor — setup and reference
 
-## Scope
+## The short version
 
-This app reads GQ GMC counters that use the legacy **GQ-RFC1201** serial protocol and publishes JSON measurements to MQTT.
+For a new installation with one supported GQ GMC counter:
 
-The supported design target is the RFC1201/two-byte-`GETCPM` family: GMC-280, GMC-300, GMC-300E, GMC-300E Plus, GMC-320 and GMC-320 Plus, subject to firmware support for the core commands used here.
+1. Plug the counter into USB.
+2. Install the app.
+3. Leave **Serial device** on `auto`.
+4. Leave **Serial baud rate** on `auto`.
+5. Leave **MQTT server override** blank so Home Assistant supplies the MQTT connection.
+6. Leave the polling interval at 5 seconds unless you have a reason to change it.
+7. Start the app.
 
-It is not a generic driver for every GQ model. In particular, GMC-500/500+/600/600+ use GQ-RFC1801 and return a four-byte CPM value; they are intentionally rejected rather than guessed at.
+If you are replacing another GMC reader, stop the old one first. Two processes talking to one serial device can interfere with each other.
 
-## Required protocol features
+## What you should see in the log
 
-The app requires documented RFC1201 responses for:
+A normal connection looks like:
 
-- `GETVER` — 14-byte identity string;
-- `GETSERIAL` — 7-byte device serial;
-- `GETCPM` — 2-byte big-endian CPM;
-- `GETVOLT` — 1-byte battery voltage.
+```text
+Starting GMC3xx Radiation Monitor
+MQTT: using Home Assistant's MQTT service
+Serial device: USB serial device (...)
+Detected device family: GMC-...
+Active serial baud: ...
+Connected. Measurements are now being sent to MQTT.
+```
 
-Very old firmware that does not implement `GETSERIAL` is outside the current scope because the serial-derived MQTT topic is part of backward compatibility with the original add-on.
+The detector serial number, serial-derived MQTT topic, MQTT username and MQTT password are not printed in normal logs.
 
-`GETTEMP` and `GETGYRO` are documented by GQ for GMC-320 Re.3.01 or later. The app therefore sends those commands only when the returned hardware/version string begins with `GMC-320`. For 280/300/300E-family units the `temp`, `x`, `y`, and `z` payload fields remain present but are `null`.
+## Supported devices
+
+This app is for GQ counters using the older RFC1201 protocol with a two-byte `GETCPM` reply. The intended family is:
+
+- GMC-280
+- GMC-300
+- GMC-300E
+- GMC-300E Plus / GMC-300E+
+- GMC-320
+- GMC-320 Plus / GMC-320+
+
+It has been tested on real GMC-300E Plus hardware reporting firmware identity `GMC-300Re 4.62`.
+
+The app expects these core RFC1201 commands and reply sizes:
+
+- `GETVER` — 14 bytes
+- `GETSERIAL` — 7 bytes
+- `GETCPM` — 2 bytes, big-endian
+- `GETVOLT` — 1 byte
+
+GMC-500/500+/600/600+ use RFC1801 and different reply formats, including four-byte CPM. They are not supported here. GMC-800 and other newer protocol families are also outside this release.
 
 ## Configuration
 
-### `port`
-
-Serial device presented by Home Assistant OS, normally `/dev/ttyUSB0`.
-
-### `baud`
+### Serial device
 
 Default: `auto`.
 
-`auto` tries the legacy RFC1201 rates supported by the build, prioritising the common/default values: 115200, 57600, 19200, 38400, 9600, 4800, 2400 and 1200 baud (plus 14400/28800 when the platform exposes those termios constants).
+Automatic mode checks common `/dev/serial/by-id/`, `/dev/ttyUSB*` and `/dev/ttyACM*` paths. Paths that resolve to the same physical device are tested only once.
 
-You can force a numeric baud by entering it as text, for example `19200`. A forced unsupported rate fails closed rather than silently selecting another rate.
+If one compatible GMC counter answers, it is selected. If more than one answers, the app asks you to choose a device explicitly instead of guessing.
 
-GQ's RFC1201 documentation states 57600 for older GMC-300 V3.xx firmware, 115200 for GMC-300 Plus V4.xx and later, and variable baud for GMC-320. Auto detection exists so a migrated installation does not need to know which rate was previously configured.
+You can enter a fixed serial path at any time. When available, a `/dev/serial/by-id/...` path is generally a better long-term choice than `/dev/ttyUSB0` because it is less likely to change after reconnects.
 
-### `mqtt_server`
+### Serial baud rate
 
-MQTT broker hostname or address. `localhost` is supported because the app uses host networking for compatibility with the original add-on.
+Default: `auto`.
 
-### `mqtt_port`
+Automatic mode tries the supported RFC1201 rates. You can enter a numeric rate, for example `19200`, when you already know the setting.
 
-MQTT TCP port. Default: `1883`.
+Once the counter is identified, the app keeps that serial connection open while it is sampling. It does not reopen the port for every reading.
 
-### `mqtt_user` / `mqtt_password`
+### MQTT server override
 
-Broker credentials. They are Home Assistant app options, not repository content. The service does not log either value.
+Default: blank.
 
-### `repeat`
+When this field is blank, the app uses Home Assistant's MQTT service API to obtain the broker host, port and temporary credentials. If those credentials change, a failed publish triggers a refresh and one immediate retry.
 
-Polling interval in seconds, 2–3600. Default: 60.
+To use a separate broker, enter its hostname/address here. The MQTT port, username and password options then become the manual connection settings.
 
-## MQTT output
+Existing installations that already contain a manual MQTT server keep using it after updating; 1.2.0 does not silently change a working broker configuration.
 
-Topic:
+### MQTT port / username / password
+
+Used only when **MQTT server override** is set.
+
+The password is stored as a Home Assistant app option and is never printed by the app.
+
+### Polling interval
+
+Default: 5 seconds. Allowed range: 2–3600 seconds.
+
+## MQTT payload
+
+The compatibility topic remains:
 
 ```text
 homeassistant/sensor/gmc3xx_<serial>
 ```
 
-Example for a 300/300E-family unit:
+Typical GMC-300/300E-family payload:
 
 ```json
 {
   "version": "GMC-300Re 4.xx",
   "serial": "compatibility-id",
   "serial_full": "14-digit-hex-id",
-  "baud": 115200,
+  "baud": 19200,
   "cpm": 18,
   "volt": 4.0,
   "temp": null,
@@ -78,93 +116,89 @@ Example for a 300/300E-family unit:
 }
 ```
 
-On a supported GMC-320 firmware, `temp`, `x`, `y`, and `z` are numeric.
+The `serial` field intentionally keeps the original add-on's non-zero-padded formatting because existing Home Assistant MQTT topics may already depend on it. `serial_full` is a fixed-width form included as metadata.
 
-### Serial fields and privacy
+For GMC-280/300/300E-family units, `temp`, `x`, `y` and `z` are `null`. GQ documents temperature/gyroscope commands for the GMC-320 path, so the app does not send those commands to models that are not meant to answer them.
 
-The original add-on formatted each of the seven serial bytes with `%x`, not `%02x`. To avoid breaking existing MQTT topics:
+## Why incomplete replies are rejected
 
-- `serial` preserves that historical compatibility format and remains part of the topic;
-- `serial_full` is the fixed-width hexadecimal identifier.
+The older reader called `read()` once and decoded whatever was in the buffer. A serial read is allowed to return fewer bytes than requested. If one response arrived in pieces, leftover bytes could cross into the next command and a pair of unrelated bytes could be interpreted as CPM.
 
-Neither detector identifier is printed in normal startup logs. Public issue reports should also redact MQTT topics/device serials unless disclosure is genuinely necessary.
+This reader instead:
 
-## Why this version avoids diagnostic commands on 300/300E-family units
+1. clears stale input before each command;
+2. waits until the exact documented reply length has been assembled;
+3. retries a short/incomplete transaction;
+4. rejects the sample if the reply still cannot be completed;
+5. reconnects the serial stream after a persistent sampling failure.
 
-The original reader requested temperature and gyroscope data from every device. GQ's RFC1201 specification documents those commands only for GMC-320 Re.3.01 or later. Sending unsupported commands increases the opportunity for timeouts, stale bytes and misframing while providing no reliable measurement.
+The 500 ms quiet period after `HEARTBEAT0` is kept because real GMC-300E Plus hardware showed that starting the first command too quickly could lead to an incomplete first reply.
 
-For RFC1201 280/300/300E-family devices this app therefore polls only the documented core fields needed for the Home Assistant radiation path: CPM and voltage. Missing optional diagnostics are represented as `null`, not zero.
+There is **no numerical CPM ceiling**. A complete, correctly framed high CPM reading is published as-is.
 
-## What was fixed
+## Automatic recovery
 
-The upstream program used one `read(fd, buf, expected_length)` call and decoded the buffer without checking that all requested bytes arrived. POSIX serial reads can legitimately be short. A fragmented version/serial/diagnostic response can therefore leave bytes that a later two-byte `GETCPM` request interprets as radiation data.
+### USB/counter problem
 
-This fork:
+A persistent serial failure ends the current stream. The app waits five seconds, finds the configured/automatic device again, identifies it and resumes.
 
-1. flushes stale input before every transaction;
-2. assembles the complete documented reply across multiple `read()` calls;
-3. retries incomplete transactions;
-4. rejects a sample if framing still cannot be completed;
-5. reads identity once at startup;
-6. auto-detects/validates the RFC1201 baud rate;
-7. avoids model-inappropriate optional commands;
-8. validates the `0xAA` terminators for GMC-320 temperature/gyro replies.
+### MQTT problem
 
-There is deliberately **no CPM ceiling**. Transport integrity, not numerical plausibility, determines whether a reading is accepted.
+A failed publication does not stop the serial reader. The app keeps trying. In automatic MQTT mode it refreshes Home Assistant's service credentials after a failure. Log warnings are rate-limited to avoid one warning every polling cycle.
+
+### App problem
+
+The app exposes a small local health port for the Home Assistant Supervisor watchdog. If the app process stops responding, Supervisor can restart it.
 
 ## Migration from the original/local add-on
 
-1. Install this app but **do not start it yet**.
-2. Copy the existing serial port, MQTT host/port/user/password and polling interval.
-3. Leave `baud` on `auto` unless you have a reason to force the known rate.
-4. Stop the old GMC app.
-5. Start **GMC3xx Fixed Radiation Monitor**.
-6. Confirm the log reports a detected device family and active baud, then `Start sending data`.
-7. In Home Assistant Developer Tools, confirm the existing CPM entity continues updating.
-8. If automations/scripts restart the old Supervisor app slug, update those references only after the new app is verified.
-9. Keep the old app stopped until the replacement has been observed for a suitable period.
+1. Install GMC3xx Radiation Monitor but do not start it yet.
+2. Disable any Home Assistant automation that can restart the old GMC add-on.
+3. Stop the old GMC add-on.
+4. Start this app.
+5. Confirm the device family and baud in the log.
+6. Confirm your existing Home Assistant CPM entity keeps changing.
+7. Only then update any recovery automation to point to this app's Supervisor slug.
+8. Keep the old app stopped until you are satisfied with the new one.
 
-**Do not run both apps simultaneously.** Competing for one serial device can itself corrupt communication.
+Do not run both readers together.
 
-### Expected change for non-320 units
+### Updating from 1.1.x
 
-If the old integration exposed `temp`, `x`, `y`, or `z` from a GMC-300/300E-family unit, those entities may become `unknown` because the new payload deliberately sends `null` for diagnostics not documented for that model. CPM and voltage remain the supported measurement path.
+The internal slug remains `gmc3xx_fixed` so Home Assistant treats 1.2.0 as an update to the same installed app.
 
-## Existing bad recorder history
+Your existing options stay in place. If you already use a stable `/dev/serial/by-id/...` path, keep it. If you already use manual MQTT settings, they remain active. You can opt into the new automatic MQTT connection later by clearing **MQTT server override**.
 
-This app prevents newly malformed serial samples from being published; it does not rewrite Home Assistant Recorder history. Previously stored false spikes remain until they age out or are deliberately purged/rebuilt.
+## Home Assistant entities
 
-## Troubleshooting
+The app publishes MQTT data; it does not replace your Home Assistant entity configuration during an upgrade. Existing MQTT sensors can continue reading the same topic and JSON keys.
 
-### `Unable to identify an RFC1201-compatible GMC counter`
+For a new setup, see the repository's `SETUP.md` for a small MQTT YAML example.
 
-Check the USB serial path and try a forced known baud if auto detection cannot identify the device. Also verify that the unit belongs to the RFC1201 family; RFC1801/newer devices are intentionally unsupported.
+## Dose-rate conversion
 
-### `incomplete response ... retrying`
+CPM-to-µSv/h conversion depends on the counter/tube and calibration. The app therefore publishes CPM and leaves any dose conversion to Home Assistant or another calibrated layer you control.
 
-A required response did not arrive completely before timeout. Occasional retries can happen during USB disturbances; persistent retries indicate a port/device/firmware/baud problem.
+## Existing Recorder history
 
-### `Rejected incomplete/malformed serial sample`
+Updating the app prevents new incomplete serial frames from being published. It does not rewrite old Home Assistant Recorder history. Previously stored false spikes remain until Recorder ages them out or you deliberately clean them up.
 
-At least one required response could not be validated. Nothing is published for that cycle. Missing data is safer than manufacturing a radiation number from misframed bytes.
+## Privacy when reporting a problem
 
-### `MQTT publish timed out`
+Before posting a public log or issue, remove:
 
-The MQTT client did not finish within 15 seconds. The loop continues after skipping that publication.
+- detector serial numbers;
+- the serial-derived MQTT topic;
+- MQTT credentials;
+- private email addresses;
+- private hostnames/IP addresses;
+- Home Assistant tokens;
+- location or household details that are not needed to reproduce the problem.
 
-## Supported Home Assistant architectures
+Normal startup logs already hide the detector identifier and MQTT credentials.
 
-- `aarch64`
-- `amd64`
+## Licence
 
-## Maintenance policy
+Derived from `gi1mic/gmc320`, GPL-3.0. This project remains GPL-3.0-only.
 
-This is a small best-effort compatibility project with no SLA or guaranteed support response. Compatibility additions should be protocol-backed and regression-tested; the project will not grow into a speculative universal GQ driver merely because model names are similar.
-
-The narrow scope is intentional to reduce maintenance burden and radiation-data risk.
-
-## Upstream and licence
-
-Derived from <https://github.com/gi1mic/gmc320>, licensed GPL-3.0. This derivative remains GPL-3.0-only. Commercial use cannot be prohibited by adding a non-commercial clause to the GPL-covered derivative; see the repository's `COMMERCIAL_USE.md`.
-
-This project is independent and not endorsed by GQ Electronics, Home Assistant or the original maintainer.
+This project is independent and is not endorsed by GQ Electronics, Home Assistant or the original maintainer.
