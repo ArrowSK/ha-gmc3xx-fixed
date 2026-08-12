@@ -1,0 +1,43 @@
+name: Finalize privacy history rewrite
+
+on:
+  workflow_run:
+    workflows:
+      - One-time privacy history rewrite
+    types:
+      - completed
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  finalize:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out sanitized main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Delete the history-rewrite workflow run and any stale runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          gh api -X DELETE "/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" || true
+          for run_id in $(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" --jq '.workflow_runs[].id'); do
+            if [[ "${run_id}" != "${GITHUB_RUN_ID}" ]]; then
+              gh api -X DELETE "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" || true
+            fi
+          done
+
+      - name: Remove one-time finalizer from sanitized history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/privacy-finalize.yml
+          git commit -m "Remove one-time privacy cleanup workflow"
+          git push origin HEAD:main

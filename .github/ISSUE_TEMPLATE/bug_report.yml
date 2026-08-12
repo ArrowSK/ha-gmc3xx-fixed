@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a reproducible problem with the GMC3xx Fixed app.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a public repository. Do not include MQTT credentials, access tokens, private keys, Home Assistant backups, detector serial numbers, serial-derived MQTT topics, private email addresses, private hostnames/IPs, or household/location details. Redact them before submitting.
+  - type: input
+    id: model
+    attributes:
+      label: GQ GMC model and firmware
+      placeholder: "Example: GMC-300E Plus, firmware 4.x"
+    validations:
+      required: true
+  - type: input
+    id: protocol
+    attributes:
+      label: Protocol family if known
+      placeholder: "RFC1201 / unknown"
+    validations:
+      required: false
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version
+    validations:
+      required: true
+  - type: input
+    id: app_version
+    attributes:
+      label: App version
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem description
+      description: What happened, what was expected, and how often it occurs.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted app logs
+      description: Remove detector serials/topics, broker/user details, IPs/hostnames, email addresses and tokens before pasting.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Privacy check
+      options:
+        - label: I reviewed the report and removed credentials and installation-specific identifiers.
+          required: true

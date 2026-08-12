@@ -1,0 +1,22 @@
+configuration:
+  port:
+    name: Serial device
+    description: USB serial device used by the GQ GMC counter, normally /dev/ttyUSB0.
+  baud:
+    name: Serial baud
+    description: Use auto to detect the RFC1201 baud rate, or enter a supported numeric rate such as 115200, 57600, or 19200.
+  mqtt_server:
+    name: MQTT server
+    description: MQTT broker hostname or address.
+  mqtt_port:
+    name: MQTT port
+    description: MQTT broker TCP port.
+  mqtt_user:
+    name: MQTT username
+    description: MQTT username; leave empty only if the broker permits anonymous publishing.
+  mqtt_password:
+    name: MQTT password
+    description: MQTT password; stored in Home Assistant app options and never logged by this app.
+  repeat:
+    name: Polling interval
+    description: Seconds between measurements (2 to 3600).
