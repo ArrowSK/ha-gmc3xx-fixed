@@ -35,7 +35,7 @@ jobs:
 
           config = docs[Path('gmc3xx_fixed/config.yaml')]
           assert config['slug'] == 'gmc3xx_fixed'
-          assert config['version'] == '1.1.1'
+          assert config['version'] == '1.1.2'
           assert config['arch'] == ['aarch64', 'amd64']
           assert config['init'] is False
           assert config['uart'] is True
@@ -99,7 +99,7 @@ jobs:
       - name: Build Home Assistant app image
         run: |
           docker build \
-            --build-arg BUILD_VERSION=1.1.1 \
+            --build-arg BUILD_VERSION=1.1.2 \
             --build-arg BUILD_ARCH=amd64 \
             --tag gmc3xx-fixed:test \
             gmc3xx_fixed
