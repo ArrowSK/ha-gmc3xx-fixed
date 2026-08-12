@@ -31,11 +31,16 @@ trap cleanup EXIT
 trap 'exit 0' TERM INT
 
 start_health_endpoint() {
-    local root="/tmp/gmc3xx-health"
-    mkdir -p "${root}"
-    printf 'ok\n' > "${root}/index.html"
-    busybox httpd -f -p "${HEALTH_PORT}" -h "${root}" >/dev/null 2>&1 &
+    # The Supervisor watchdog only needs a TCP connection to succeed. Keep this
+    # health listener deliberately independent from the serial/MQTT workers so
+    # it can report whether the app process itself is alive.
+    socat "TCP-LISTEN:${HEALTH_PORT},reuseaddr,fork" EXEC:/bin/true >/dev/null 2>&1 &
     HEALTH_PID=$!
+    sleep 0.1
+    if ! kill -0 "${HEALTH_PID}" 2>/dev/null; then
+        bashio::log.error "Unable to start the Supervisor watchdog listener"
+        return 1
+    fi
 }
 
 port_description() {
