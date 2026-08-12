@@ -1,0 +1,1727 @@
+name: One-time v1.2 release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Write v1.2.0 release files
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          files = {}
+
+          files['gmc3xx_fixed/config.yaml'] = r'''name: "GMC3xx Radiation Monitor"
+description: "Reliable serial-to-MQTT monitoring for GQ GMC counters using the legacy RFC1201 protocol"
+version: "1.2.0"
+slug: "gmc3xx_fixed"
+url: "https://github.com/ArrowSK/ha-gmc3xx-fixed"
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: auto
+init: false
+uart: true
+host_network: true
+services:
+  - mqtt:want
+options:
+  port: "/dev/ttyUSB0"
+  baud: "auto"
+  mqtt_server: ""
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  repeat: 5
+schema:
+  port: "device(subsystem=tty)"
+  baud: str
+  mqtt_server: str
+  mqtt_port: port
+  mqtt_user: str
+  mqtt_password: password
+  repeat: "int(2,3600)"
+'''
+
+          files['gmc3xx_fixed/Dockerfile'] = r'''FROM ghcr.io/home-assistant/base:3.22
+
+ARG BUILD_VERSION
+ARG BUILD_ARCH
+
+LABEL \
+  io.hass.version="${BUILD_VERSION}" \
+  io.hass.type="app" \
+  io.hass.arch="${BUILD_ARCH}" \
+  org.opencontainers.image.title="GMC3xx Radiation Monitor" \
+  org.opencontainers.image.description="Reliable serial-to-MQTT monitoring for legacy GQ GMC-300/320 radiation monitors" \
+  org.opencontainers.image.source="https://github.com/ArrowSK/ha-gmc3xx-fixed" \
+  org.opencontainers.image.licenses="GPL-3.0-only"
+
+RUN apk add --no-cache \
+      jq \
+      mosquitto-clients \
+      coreutils \
+    && apk add --no-cache --virtual .build-deps \
+      build-base \
+    && mkdir -p /usr/src/gmc3xx
+
+COPY src/gmc320.c /usr/src/gmc3xx/gmc320.c
+
+RUN cc -std=c11 -Wall -Wextra -Werror -O2 \
+      /usr/src/gmc3xx/gmc320.c -o /usr/local/bin/gmc320 \
+    && strip /usr/local/bin/gmc320 \
+    && apk del .build-deps \
+    && rm -rf /usr/src/gmc3xx
+
+COPY run.sh /run.sh
+RUN chmod 0755 /run.sh
+
+CMD ["/run.sh"]
+'''
+
+          files['gmc3xx_fixed/run.sh'] = r'''#!/usr/bin/with-contenv bashio
+set -u
+
+PORT="$(bashio::config 'port')"
+BAUD_SETTING="$(bashio::config 'baud')"
+MQTT_SERVER_CONFIG="$(bashio::config 'mqtt_server')"
+MQTT_PORT_CONFIG="$(bashio::config 'mqtt_port')"
+MQTT_USER_CONFIG="$(bashio::config 'mqtt_user')"
+MQTT_PASSWORD_CONFIG="$(bashio::config 'mqtt_password')"
+DELAY="$(bashio::config 'repeat')"
+
+SERIAL_RETRY_SECONDS=3
+MQTT_TIMEOUT_SECONDS=4
+MQTT_HOST=""
+MQTT_PORT=""
+MQTT_USER=""
+MQTT_PASSWORD=""
+MQTT_SOURCE=""
+SERIAL_PID=""
+
+bashio::log.info "Starting GMC3xx Radiation Monitor"
+bashio::log.info "Serial device: ${PORT}"
+bashio::log.info "Baud setting: ${BAUD_SETTING}"
+bashio::log.info "Polling interval: ${DELAY}s"
+
+stop_child() {
+    if [[ -n "${SERIAL_PID}" ]] && kill -0 "${SERIAL_PID}" 2>/dev/null; then
+        kill "${SERIAL_PID}" 2>/dev/null || true
+        wait "${SERIAL_PID}" 2>/dev/null || true
+    fi
+    SERIAL_PID=""
+}
+
+shutdown() {
+    bashio::log.info "Stopping GMC3xx Radiation Monitor"
+    stop_child
+    exit 0
+}
+trap shutdown TERM INT
+
+resolve_mqtt() {
+    MQTT_HOST=""
+    MQTT_PORT=""
+    MQTT_USER=""
+    MQTT_PASSWORD=""
+    MQTT_SOURCE=""
+
+    # Backwards compatibility: an explicitly configured broker always wins.
+    if [[ -n "${MQTT_SERVER_CONFIG}" ]]; then
+        MQTT_HOST="${MQTT_SERVER_CONFIG}"
+        MQTT_PORT="${MQTT_PORT_CONFIG}"
+        MQTT_USER="${MQTT_USER_CONFIG}"
+        MQTT_PASSWORD="${MQTT_PASSWORD_CONFIG}"
+        MQTT_SOURCE="manual configuration"
+        return 0
+    fi
+
+    # New installs can leave mqtt_server blank. When Home Assistant exposes an
+    # MQTT service, use its current connection details without storing them in
+    # this repository or printing them in the log.
+    if bashio::services.available 'mqtt' >/dev/null 2>&1; then
+        MQTT_HOST="$(bashio::services 'mqtt' 'host' 2>/dev/null || true)"
+        MQTT_PORT="$(bashio::services 'mqtt' 'port' 2>/dev/null || true)"
+        MQTT_USER="$(bashio::services 'mqtt' 'username' 2>/dev/null || true)"
+        MQTT_PASSWORD="$(bashio::services 'mqtt' 'password' 2>/dev/null || true)"
+        if [[ -n "${MQTT_HOST}" ]]; then
+            [[ -n "${MQTT_PORT}" ]] || MQTT_PORT=1883
+            MQTT_SOURCE="Home Assistant MQTT service"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+build_mqtt_args() {
+    local topic="$1"
+    MQTT_ARGS=(
+        -h "${MQTT_HOST}"
+        -p "${MQTT_PORT}"
+        -t "${topic}"
+        -q 0
+    )
+    if [[ -n "${MQTT_USER}" ]]; then
+        MQTT_ARGS+=( -u "${MQTT_USER}" )
+    fi
+    if [[ -n "${MQTT_PASSWORD}" ]]; then
+        MQTT_ARGS+=( -P "${MQTT_PASSWORD}" )
+    fi
+}
+
+publish_payload() {
+    local topic="$1"
+    local payload="$2"
+    local rc=1
+
+    for attempt in 1 2; do
+        if [[ -z "${MQTT_HOST}" ]] && ! resolve_mqtt; then
+            if [[ ${attempt} -eq 1 ]]; then
+                bashio::log.warning "MQTT service is not available yet; retrying"
+                sleep 1
+                continue
+            fi
+            return 1
+        fi
+
+        build_mqtt_args "${topic}"
+        timeout "${MQTT_TIMEOUT_SECONDS}s" \
+            mosquitto_pub "${MQTT_ARGS[@]}" -m "${payload}"
+        rc=$?
+        if [[ ${rc} -eq 0 ]]; then
+            return 0
+        fi
+
+        # Service credentials or broker endpoints can change after an MQTT
+        # restart. Refresh automatically when using the HA-provided service.
+        if [[ -z "${MQTT_SERVER_CONFIG}" ]]; then
+            MQTT_HOST=""
+            MQTT_PORT=""
+            MQTT_USER=""
+            MQTT_PASSWORD=""
+            MQTT_SOURCE=""
+        fi
+
+        if [[ ${attempt} -eq 1 ]]; then
+            sleep 1
+        fi
+    done
+
+    if [[ ${rc} -eq 124 ]]; then
+        bashio::log.warning "MQTT publish timed out; the sample was not published"
+    else
+        bashio::log.warning "MQTT publish failed (exit ${rc}); the sample was not published"
+    fi
+    return 1
+}
+
+while true; do
+    while [[ ! -e "${PORT}" ]]; do
+        bashio::log.warning "Serial device is not present; retrying in ${SERIAL_RETRY_SECONDS}s"
+        sleep "${SERIAL_RETRY_SECONDS}"
+    done
+
+    # Keep one serial session open. gmc320 exits only after a persistent serial
+    # transaction failure; this outer loop then reconnects and re-identifies the
+    # counter automatically. Normal polling never reopens the USB port.
+    coproc SERIAL_STREAM { gmc320 --stream "${PORT}" "${BAUD_SETTING}" "${DELAY}"; }
+    SERIAL_PID="${SERIAL_STREAM_PID}"
+    SERIAL_FD="${SERIAL_STREAM[0]}"
+    FIRST_SAMPLE=1
+
+    while IFS= read -r DATA <&"${SERIAL_FD}"; do
+        if ! printf '%s' "${DATA}" | jq -e '
+            .version and .serial and .serial_full and .baud and
+            has("cpm") and has("volt") and has("temp") and
+            has("x") and has("y") and has("z") and
+            .cpm != null and .volt != null
+        ' >/dev/null 2>&1; then
+            bashio::log.warning "Rejected malformed serial payload; nothing published"
+            continue
+        fi
+
+        VERSION="$(printf '%s' "${DATA}" | jq -r '.version')"
+        BAUD="$(printf '%s' "${DATA}" | jq -r '.baud')"
+        SERIAL="$(printf '%s' "${DATA}" | jq -r '.serial')"
+        TOPIC="homeassistant/sensor/gmc3xx_${SERIAL}"
+
+        if [[ ${FIRST_SAMPLE} -eq 1 ]]; then
+            bashio::log.info "Detected device family: ${VERSION}"
+            bashio::log.info "Active serial baud: ${BAUD}"
+            if [[ "${VERSION}" == GMC-320* ]]; then
+                bashio::log.info "GMC-320 diagnostics enabled (temperature/gyroscope)"
+            else
+                bashio::log.info "GMC-320-only diagnostics disabled for this model"
+            fi
+            bashio::log.info "Persistent serial session established"
+            bashio::log.info "MQTT topic derived from detector serial (identifier redacted from log)"
+            FIRST_SAMPLE=0
+        fi
+
+        if publish_payload "${TOPIC}" "${DATA}"; then
+            if [[ -n "${MQTT_SOURCE}" ]]; then
+                # Log the source once per serial session, never credentials.
+                if [[ ! -e /tmp/gmc3xx_mqtt_source_logged ]]; then
+                    bashio::log.info "MQTT connection source: ${MQTT_SOURCE}"
+                    : > /tmp/gmc3xx_mqtt_source_logged
+                fi
+            fi
+        fi
+    done
+
+    CHILD_PID="${SERIAL_PID}"
+    SERIAL_PID=""
+    wait "${CHILD_PID}" 2>/dev/null || true
+    bashio::log.warning "Serial session ended; reconnecting in ${SERIAL_RETRY_SECONDS}s"
+    sleep "${SERIAL_RETRY_SECONDS}"
+done
+'''
+
+          files['gmc3xx_fixed/src/gmc320.c'] = r'''/*
+ * GMC3xx serial reader for Home Assistant.
+ *
+ * This file is derived from gi1mic/gmc320 (GPL-3.0), which in turn notes
+ * that parts were based on code by Christoph Haas.
+ *
+ * Modified 2026 for robust RFC1201-family serial framing and compatibility:
+ *   - exact-length reads with bounded timeouts and retries;
+ *   - stale-input flushing around every request;
+ *   - heartbeat quiescence before framed polling;
+ *   - baud probing without sending state-changing commands at wrong rates;
+ *   - GMC-320-only diagnostics gated by identified model;
+ *   - persistent serial streaming so normal polling does not reopen USB;
+ *   - fail-closed reconnect semantics after persistent serial failure;
+ *   - legacy serial formatting retained for MQTT topic compatibility.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+#define _DEFAULT_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+
+#define GMC_TIMEOUT_MS 1800
+#define GMC_IDENTIFY_TIMEOUT_MS 900
+#define GMC_RETRIES 3
+#define GMC_INTER_COMMAND_US 25000
+#define GMC_HEARTBEAT_QUIET_MS 500
+#define GMC_HEARTBEAT_HARD_LIMIT_MS 2500
+
+struct baud_entry {
+    int rate;
+    speed_t speed;
+};
+
+static const struct baud_entry BAUDS[] = {
+    {115200, B115200},
+    {57600, B57600},
+    {19200, B19200},
+    {38400, B38400},
+    {9600, B9600},
+    {4800, B4800},
+    {2400, B2400},
+    {1200, B1200},
+#ifdef B14400
+    {14400, B14400},
+#endif
+#ifdef B28800
+    {28800, B28800},
+#endif
+};
+
+static long long monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static const struct baud_entry *find_baud(int rate) {
+    for (size_t i = 0; i < sizeof(BAUDS) / sizeof(BAUDS[0]); ++i) {
+        if (BAUDS[i].rate == rate) {
+            return &BAUDS[i];
+        }
+    }
+    return NULL;
+}
+
+static int parse_positive_int(const char *s, int *out) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || value <= 0 || value > 1000000) {
+        return -1;
+    }
+    *out = (int)value;
+    return 0;
+}
+
+static int write_all(int fd, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t written = write(fd, buf + off, len - off);
+        if (written > 0) {
+            off += (size_t)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int read_exact(int fd, uint8_t *buf, size_t len, int timeout_ms) {
+    size_t off = 0;
+    const long long deadline = monotonic_ms() + timeout_ms;
+
+    while (off < len) {
+        const long long now = monotonic_ms();
+        int remaining = (int)(deadline - now);
+        if (remaining <= 0) {
+            break;
+        }
+
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLIN,
+            .revents = 0,
+        };
+        int prc = poll(&pfd, 1, remaining);
+        if (prc == 0) {
+            break;
+        }
+        if (prc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (!(pfd.revents & (POLLIN | POLLHUP))) {
+            return -1;
+        }
+
+        ssize_t got = read(fd, buf + off, len - off);
+        if (got > 0) {
+            off += (size_t)got;
+            continue;
+        }
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        }
+        if (got == 0 && (pfd.revents & POLLHUP)) {
+            return -1;
+        }
+        if (got == 0) {
+            continue;
+        }
+        return -1;
+    }
+
+    return off == len ? 0 : -1;
+}
+
+static int flush_input(int fd) {
+    if (tcflush(fd, TCIFLUSH) != 0) {
+        fprintf(stderr, "serial: tcflush failed: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int drain_until_quiet(int fd, int quiet_ms, int hard_limit_ms) {
+    const long long hard_deadline = monotonic_ms() + hard_limit_ms;
+    uint8_t discard[64];
+
+    while (true) {
+        const long long now = monotonic_ms();
+        int hard_remaining = (int)(hard_deadline - now);
+        if (hard_remaining <= 0) {
+            return -1;
+        }
+        const int wait_ms = hard_remaining < quiet_ms ? hard_remaining : quiet_ms;
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLIN,
+            .revents = 0,
+        };
+        int prc = poll(&pfd, 1, wait_ms);
+        if (prc == 0) {
+            return wait_ms == quiet_ms ? flush_input(fd) : -1;
+        }
+        if (prc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (!(pfd.revents & (POLLIN | POLLHUP))) {
+            return -1;
+        }
+        ssize_t got = read(fd, discard, sizeof(discard));
+        if (got > 0) {
+            continue;
+        }
+        if (got < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        }
+        if (got == 0 && (pfd.revents & POLLHUP)) {
+            return -1;
+        }
+        if (got == 0) {
+            continue;
+        }
+        return -1;
+    }
+}
+
+static int transact_exact_opts(int fd, const char *cmd, uint8_t *reply,
+                               size_t reply_len, int timeout_ms, int retries,
+                               bool quiet) {
+    for (int attempt = 1; attempt <= retries; ++attempt) {
+        if (flush_input(fd) != 0) {
+            return -1;
+        }
+        usleep(GMC_INTER_COMMAND_US);
+        if (flush_input(fd) != 0) {
+            return -1;
+        }
+        if (write_all(fd, (const uint8_t *)cmd, strlen(cmd)) != 0) {
+            if (!quiet) {
+                fprintf(stderr, "serial: write failed for %s: %s\n", cmd, strerror(errno));
+            }
+            return -1;
+        }
+        if (tcdrain(fd) != 0) {
+            if (!quiet) {
+                fprintf(stderr, "serial: tcdrain failed for %s: %s\n", cmd, strerror(errno));
+            }
+            return -1;
+        }
+        memset(reply, 0, reply_len);
+        if (read_exact(fd, reply, reply_len, timeout_ms) == 0) {
+            return 0;
+        }
+        if (!quiet && attempt < retries) {
+            fprintf(stderr,
+                    "serial: incomplete response for %s (attempt %d/%d); retrying\n",
+                    cmd, attempt, retries);
+        }
+        usleep(50000);
+    }
+    if (!quiet) {
+        fprintf(stderr, "serial: failed to obtain complete response for %s\n", cmd);
+    }
+    return -1;
+}
+
+static int transact_exact(int fd, const char *cmd, uint8_t *reply, size_t reply_len) {
+    return transact_exact_opts(fd, cmd, reply, reply_len,
+                               GMC_TIMEOUT_MS, GMC_RETRIES, false);
+}
+
+static int open_serial_configured(const char *device, int baud_rate) {
+    const struct baud_entry *baud = find_baud(baud_rate);
+    if (baud == NULL) {
+        fprintf(stderr, "serial: unsupported baud rate %d\n", baud_rate);
+        return -1;
+    }
+    int fd = open(device, O_RDWR | O_NOCTTY);
+    if (fd < 0) {
+        fprintf(stderr, "serial: cannot open %s: %s\n", device, strerror(errno));
+        return -1;
+    }
+    struct termios tio;
+    if (tcgetattr(fd, &tio) != 0) {
+        fprintf(stderr, "serial: tcgetattr failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    cfmakeraw(&tio);
+    tio.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
+    tio.c_cflag |= CS8 | CREAD | CLOCAL;
+#ifdef CRTSCTS
+    tio.c_cflag &= ~CRTSCTS;
+#endif
+    tio.c_cc[VMIN] = 0;
+    tio.c_cc[VTIME] = 1;
+    if (cfsetispeed(&tio, baud->speed) != 0 || cfsetospeed(&tio, baud->speed) != 0) {
+        fprintf(stderr, "serial: unable to set %d baud: %s\n", baud_rate, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (tcsetattr(fd, TCSANOW, &tio) != 0) {
+        fprintf(stderr, "serial: tcsetattr failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (flush_input(fd) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int disable_heartbeat(int fd) {
+    const char *cmd = "<HEARTBEAT0>>";
+    if (flush_input(fd) != 0) {
+        return -1;
+    }
+    if (write_all(fd, (const uint8_t *)cmd, strlen(cmd)) != 0) {
+        return -1;
+    }
+    if (tcdrain(fd) != 0) {
+        return -1;
+    }
+    if (drain_until_quiet(fd, GMC_HEARTBEAT_QUIET_MS,
+                          GMC_HEARTBEAT_HARD_LIMIT_MS) != 0) {
+        fprintf(stderr, "serial: input did not become quiet after HEARTBEAT0\n");
+        return -1;
+    }
+    return 0;
+}
+
+static void json_print_string(const char *s) {
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+        switch (*p) {
+            case '"': fputs("\\\"", stdout); break;
+            case '\\': fputs("\\\\", stdout); break;
+            case '\b': fputs("\\b", stdout); break;
+            case '\f': fputs("\\f", stdout); break;
+            case '\n': fputs("\\n", stdout); break;
+            case '\r': fputs("\\r", stdout); break;
+            case '\t': fputs("\\t", stdout); break;
+            default:
+                if (*p < 0x20) {
+                    printf("\\u%04x", *p);
+                } else {
+                    putchar(*p);
+                }
+        }
+    }
+    putchar('"');
+}
+
+static void sanitize_ascii(char *dst, size_t dst_len, const uint8_t *src, size_t src_len) {
+    size_t out = 0;
+    for (size_t i = 0; i < src_len && out + 1 < dst_len; ++i) {
+        const unsigned char ch = src[i];
+        dst[out++] = (ch >= 0x20 && ch <= 0x7e) ? (char)ch : '?';
+    }
+    dst[out] = '\0';
+}
+
+static bool valid_rfc1201_version(const char *version) {
+    return strncmp(version, "GMC-", 4) == 0 && strlen(version) >= 8;
+}
+
+static bool model_has_320_diagnostics(const char *version) {
+    return strncmp(version, "GMC-320", 7) == 0;
+}
+
+static void format_serial_compat(char *dst, size_t dst_len, const uint8_t raw[7]) {
+    size_t used = 0;
+    dst[0] = '\0';
+    for (size_t i = 0; i < 7; ++i) {
+        if (used >= dst_len) {
+            break;
+        }
+        int n = snprintf(dst + used, dst_len - used, "%x", raw[i]);
+        if (n < 0) {
+            dst[0] = '\0';
+            return;
+        }
+        if ((size_t)n >= dst_len - used) {
+            dst[dst_len - 1] = '\0';
+            return;
+        }
+        used += (size_t)n;
+    }
+}
+
+static void format_serial_full(char *dst, size_t dst_len, const uint8_t raw[7]) {
+    if (dst_len < 15) {
+        if (dst_len > 0) {
+            dst[0] = '\0';
+        }
+        return;
+    }
+    snprintf(dst, dst_len, "%02x%02x%02x%02x%02x%02x%02x",
+             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
+}
+
+static uint16_t decode_be16(const uint8_t bytes[2]) {
+    return (uint16_t)(((uint16_t)bytes[0] << 8) | bytes[1]);
+}
+
+static int read_version(int fd, char *version, size_t version_len,
+                        int timeout_ms, int retries, bool quiet) {
+    uint8_t raw[14];
+    if (transact_exact_opts(fd, "<GETVER>>", raw, sizeof(raw),
+                            timeout_ms, retries, quiet) != 0) {
+        return -1;
+    }
+    sanitize_ascii(version, version_len, raw, sizeof(raw));
+    return valid_rfc1201_version(version) ? 0 : -1;
+}
+
+static int probe_version(int fd, char *version, size_t version_len) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (read_version(fd, version, version_len,
+                         GMC_IDENTIFY_TIMEOUT_MS, 1, true) == 0) {
+            return 0;
+        }
+        usleep(75000);
+    }
+    return -1;
+}
+
+static int get_identity_on_fd(int fd, char *version, size_t version_len,
+                              char *serial_compat, size_t serial_compat_len,
+                              char *serial_full, size_t serial_full_len) {
+    uint8_t serial_raw[7];
+    if (read_version(fd, version, version_len,
+                     GMC_TIMEOUT_MS, GMC_RETRIES, false) != 0) {
+        return -1;
+    }
+    if (transact_exact(fd, "<GETSERIAL>>", serial_raw, sizeof(serial_raw)) != 0) {
+        return -1;
+    }
+    format_serial_compat(serial_compat, serial_compat_len, serial_raw);
+    format_serial_full(serial_full, serial_full_len, serial_raw);
+    if (serial_compat[0] == '\0' || serial_full[0] == '\0') {
+        fprintf(stderr, "serial: invalid empty identity response\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int identify_device(const char *device, const char *baud_spec,
+                           int *fd_out, int *baud_out,
+                           char *version, size_t version_len,
+                           char *serial_compat, size_t serial_compat_len,
+                           char *serial_full, size_t serial_full_len) {
+    if (strcmp(baud_spec, "auto") != 0) {
+        int requested = 0;
+        if (parse_positive_int(baud_spec, &requested) != 0 || find_baud(requested) == NULL) {
+            fprintf(stderr, "serial: invalid/unsupported baud setting '%s'\n", baud_spec);
+            return -1;
+        }
+        int fd = open_serial_configured(device, requested);
+        if (fd < 0) {
+            return -1;
+        }
+        if (disable_heartbeat(fd) != 0 ||
+            get_identity_on_fd(fd, version, version_len,
+                               serial_compat, serial_compat_len,
+                               serial_full, serial_full_len) != 0) {
+            close(fd);
+            return -1;
+        }
+        *fd_out = fd;
+        *baud_out = requested;
+        return 0;
+    }
+
+    /* Probe only with the read-only GETVER command. HEARTBEAT0 is sent only
+     * after a valid GMC response identifies the correct baud. */
+    for (size_t i = 0; i < sizeof(BAUDS) / sizeof(BAUDS[0]); ++i) {
+        int fd = open_serial_configured(device, BAUDS[i].rate);
+        if (fd < 0) {
+            continue;
+        }
+        char probe[32] = {0};
+        if (probe_version(fd, probe, sizeof(probe)) == 0 &&
+            disable_heartbeat(fd) == 0 &&
+            get_identity_on_fd(fd, version, version_len,
+                               serial_compat, serial_compat_len,
+                               serial_full, serial_full_len) == 0) {
+            *fd_out = fd;
+            *baud_out = BAUDS[i].rate;
+            return 0;
+        }
+        close(fd);
+    }
+
+    fprintf(stderr, "serial: no RFC1201-compatible GMC identity found at supported baud rates\n");
+    return -1;
+}
+
+struct sample {
+    uint16_t cpm;
+    double volt;
+    bool has_temp;
+    double temp;
+    bool has_gyro;
+    uint16_t x;
+    uint16_t y;
+    uint16_t z;
+};
+
+static int get_sample(int fd, bool enable_320_diagnostics, struct sample *out) {
+    uint8_t cpm_raw[2];
+    uint8_t volt_raw[1];
+    memset(out, 0, sizeof(*out));
+
+    if (transact_exact(fd, "<GETCPM>>", cpm_raw, sizeof(cpm_raw)) != 0) {
+        return -1;
+    }
+    if (transact_exact(fd, "<GETVOLT>>", volt_raw, sizeof(volt_raw)) != 0) {
+        return -1;
+    }
+    out->cpm = decode_be16(cpm_raw);
+    out->volt = (double)volt_raw[0] / 10.0;
+
+    if (!enable_320_diagnostics) {
+        return 0;
+    }
+
+    uint8_t temp_raw[4];
+    uint8_t gyro_raw[7];
+    if (transact_exact(fd, "<GETTEMP>>", temp_raw, sizeof(temp_raw)) != 0) {
+        return -1;
+    }
+    if (temp_raw[3] != 0xAA) {
+        fprintf(stderr, "serial: invalid GETTEMP terminator 0x%02x; sample rejected\n",
+                temp_raw[3]);
+        return -1;
+    }
+    if (transact_exact(fd, "<GETGYRO>>", gyro_raw, sizeof(gyro_raw)) != 0) {
+        return -1;
+    }
+    if (gyro_raw[6] != 0xAA) {
+        fprintf(stderr, "serial: invalid GETGYRO terminator 0x%02x; sample rejected\n",
+                gyro_raw[6]);
+        return -1;
+    }
+
+    double temp = (double)temp_raw[0] + ((double)temp_raw[1] / 10.0);
+    if (temp_raw[2] != 0) {
+        temp = -temp;
+    }
+    out->has_temp = true;
+    out->temp = temp;
+    out->has_gyro = true;
+    out->x = decode_be16(&gyro_raw[0]);
+    out->y = decode_be16(&gyro_raw[2]);
+    out->z = decode_be16(&gyro_raw[4]);
+    return 0;
+}
+
+static void print_identity_json(const char *version, const char *serial_compat,
+                                const char *serial_full, int baud,
+                                bool has_320_diagnostics) {
+    fputs("{\"version\":", stdout);
+    json_print_string(version);
+    fputs(",\"serial\":", stdout);
+    json_print_string(serial_compat);
+    fputs(",\"serial_full\":", stdout);
+    json_print_string(serial_full);
+    printf(",\"baud\":%d,\"has_temp\":%s,\"has_gyro\":%s}\n",
+           baud,
+           has_320_diagnostics ? "true" : "false",
+           has_320_diagnostics ? "true" : "false");
+}
+
+static void print_sample_json(const struct sample *s) {
+    printf("{\"cpm\":%u,\"volt\":%.1f,\"temp\":", s->cpm, s->volt);
+    if (s->has_temp) printf("%.1f", s->temp); else fputs("null", stdout);
+    fputs(",\"x\":", stdout);
+    if (s->has_gyro) printf("%u", s->x); else fputs("null", stdout);
+    fputs(",\"y\":", stdout);
+    if (s->has_gyro) printf("%u", s->y); else fputs("null", stdout);
+    fputs(",\"z\":", stdout);
+    if (s->has_gyro) printf("%u", s->z); else fputs("null", stdout);
+    fputs("}\n", stdout);
+}
+
+static void print_payload_json(const char *version, const char *serial_compat,
+                               const char *serial_full, int baud,
+                               const struct sample *s) {
+    fputs("{\"version\":", stdout);
+    json_print_string(version);
+    fputs(",\"serial\":", stdout);
+    json_print_string(serial_compat);
+    fputs(",\"serial_full\":", stdout);
+    json_print_string(serial_full);
+    printf(",\"baud\":%d,\"cpm\":%u,\"volt\":%.1f,\"temp\":",
+           baud, s->cpm, s->volt);
+    if (s->has_temp) printf("%.1f", s->temp); else fputs("null", stdout);
+    fputs(",\"x\":", stdout);
+    if (s->has_gyro) printf("%u", s->x); else fputs("null", stdout);
+    fputs(",\"y\":", stdout);
+    if (s->has_gyro) printf("%u", s->y); else fputs("null", stdout);
+    fputs(",\"z\":", stdout);
+    if (s->has_gyro) printf("%u", s->z); else fputs("null", stdout);
+    fputs("}\n", stdout);
+}
+
+static int stream_device(const char *device, const char *baud_spec, int interval) {
+    int fd = -1;
+    int baud = 0;
+    char version[32] = {0};
+    char serial_compat[32] = {0};
+    char serial_full[32] = {0};
+
+    if (identify_device(device, baud_spec, &fd, &baud,
+                        version, sizeof(version),
+                        serial_compat, sizeof(serial_compat),
+                        serial_full, sizeof(serial_full)) != 0) {
+        return 1;
+    }
+
+    const bool diagnostics = model_has_320_diagnostics(version);
+    while (true) {
+        struct sample sample;
+        if (get_sample(fd, diagnostics, &sample) != 0) {
+            fprintf(stderr, "serial: persistent session lost; reconnect required\n");
+            close(fd);
+            return 1;
+        }
+        print_payload_json(version, serial_compat, serial_full, baud, &sample);
+        fflush(stdout);
+        unsigned int remaining = (unsigned int)interval;
+        while (remaining > 0) {
+            remaining = sleep(remaining);
+        }
+    }
+}
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+            "Usage:\n"
+            "  %s --identify DEVICE BAUD|auto\n"
+            "  %s --sample DEVICE BAUD DIAGNOSTICS\n"
+            "  %s --stream DEVICE BAUD|auto INTERVAL_SECONDS\n",
+            prog, prog, prog);
+}
+
+int main(int argc, char **argv) {
+    if (argc == 4 && strcmp(argv[1], "--identify") == 0) {
+        int fd = -1;
+        int baud = 0;
+        char version[32] = {0};
+        char serial_compat[32] = {0};
+        char serial_full[32] = {0};
+        if (identify_device(argv[2], argv[3], &fd, &baud,
+                            version, sizeof(version),
+                            serial_compat, sizeof(serial_compat),
+                            serial_full, sizeof(serial_full)) != 0) {
+            return 1;
+        }
+        const bool diagnostics = model_has_320_diagnostics(version);
+        print_identity_json(version, serial_compat, serial_full, baud, diagnostics);
+        close(fd);
+        return 0;
+    }
+
+    if (argc == 5 && strcmp(argv[1], "--sample") == 0) {
+        int baud = 0;
+        if (parse_positive_int(argv[3], &baud) != 0 || find_baud(baud) == NULL) {
+            fprintf(stderr, "serial: invalid/unsupported sample baud '%s'\n", argv[3]);
+            return 2;
+        }
+        if (strcmp(argv[4], "0") != 0 && strcmp(argv[4], "1") != 0) {
+            fprintf(stderr, "serial: diagnostics flag must be 0 or 1\n");
+            return 2;
+        }
+        int fd = open_serial_configured(argv[2], baud);
+        if (fd < 0 || disable_heartbeat(fd) != 0) {
+            if (fd >= 0) close(fd);
+            return 1;
+        }
+        struct sample sample;
+        int rc = get_sample(fd, strcmp(argv[4], "1") == 0, &sample);
+        if (rc == 0) {
+            print_sample_json(&sample);
+        }
+        close(fd);
+        return rc == 0 ? 0 : 1;
+    }
+
+    if (argc == 5 && strcmp(argv[1], "--stream") == 0) {
+        int interval = 0;
+        if (parse_positive_int(argv[4], &interval) != 0 || interval < 2 || interval > 3600) {
+            fprintf(stderr, "serial: interval must be between 2 and 3600 seconds\n");
+            return 2;
+        }
+        return stream_device(argv[2], argv[3], interval);
+    }
+
+    usage(argv[0]);
+    return 2;
+}
+'''
+
+          files['tests/test_protocol.py'] = r'''#!/usr/bin/env python3
+import json
+import os
+import pty
+import select
+import subprocess
+import sys
+import threading
+import time
+
+BINARY = os.environ.get("GMC320_BINARY", "./gmc320-test")
+HEARTBEAT = b"<HEARTBEAT0>>"
+IDENTITY = {
+    b"<GETVER>>": b"GMC-300Re 4.62",
+    b"<GETSERIAL>>": bytes.fromhex("ab 0c 01 23 04 de f0"),
+}
+CORE_SAMPLE = {
+    b"<GETCPM>>": bytes([0x00, 0x12]),
+    b"<GETVOLT>>": bytes([40]),
+}
+DIAG_SAMPLE = {
+    b"<GETCPM>>": bytes([0x00, 0x12]),
+    b"<GETVOLT>>": bytes([40]),
+    b"<GETTEMP>>": bytes([25, 3, 0, 0xAA]),
+    b"<GETGYRO>>": bytes([0, 1, 0, 2, 0, 3, 0xAA]),
+}
+
+
+def simulator(master_fd, commands, stop_event, heartbeat_tail=b""):
+    pending = b""
+    index = 0
+    while not stop_event.is_set() and index < len(commands):
+        readable, _, _ = select.select([master_fd], [], [], 4)
+        if not readable:
+            continue
+        chunk = os.read(master_fd, 256)
+        if not chunk:
+            continue
+        pending += chunk
+        progressed = True
+        while progressed and index < len(commands):
+            progressed = False
+            expected, response = commands[index]
+            pos = pending.find(expected)
+            if pos >= 0:
+                pending = pending[pos + len(expected):]
+                index += 1
+                progressed = True
+                if expected == HEARTBEAT:
+                    if heartbeat_tail:
+                        time.sleep(0.10)
+                        for byte in heartbeat_tail:
+                            os.write(master_fd, bytes([byte]))
+                            time.sleep(0.03)
+                    continue
+                for byte in response:
+                    os.write(master_fd, bytes([byte]))
+                    time.sleep(0.015)
+    if index < len(commands) and not stop_event.is_set():
+        raise RuntimeError(f"Simulator did not receive command {index + 1}/{len(commands)}")
+
+
+def commands_for_identity(responses, heartbeat_tail=False):
+    return [
+        (HEARTBEAT, b""),
+        (b"<GETVER>>", responses[b"<GETVER>>"]),
+        (b"<GETSERIAL>>", responses[b"<GETSERIAL>>"]),
+    ]
+
+
+def run_case(args, commands, heartbeat_tail=b""):
+    master_fd, slave_fd = pty.openpty()
+    slave_name = os.ttyname(slave_fd)
+    stop_event = threading.Event()
+    errors = []
+
+    def worker():
+        try:
+            simulator(master_fd, commands, stop_event, heartbeat_tail)
+        except Exception as exc:
+            errors.append(exc)
+            stop_event.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    proc = subprocess.run(
+        [BINARY] + [arg.replace("{DEVICE}", slave_name) for arg in args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+    stop_event.set()
+    thread.join(timeout=2)
+    os.close(slave_fd)
+    os.close(master_fd)
+    if errors:
+        raise errors[0]
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"args={args} exited {proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def run_stream_two_samples(heartbeat_tail=b""):
+    master_fd, slave_fd = pty.openpty()
+    slave_name = os.ttyname(slave_fd)
+    stop_event = threading.Event()
+    errors = []
+    commands = commands_for_identity(IDENTITY) + [
+        (b"<GETCPM>>", CORE_SAMPLE[b"<GETCPM>>"]),
+        (b"<GETVOLT>>", CORE_SAMPLE[b"<GETVOLT>>"]),
+        (b"<GETCPM>>", bytes([0x00, 0x13])),
+        (b"<GETVOLT>>", CORE_SAMPLE[b"<GETVOLT>>"]),
+    ]
+
+    def worker():
+        try:
+            simulator(master_fd, commands, stop_event, heartbeat_tail)
+        except Exception as exc:
+            errors.append(exc)
+            stop_event.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    proc = subprocess.Popen(
+        [BINARY, "--stream", slave_name, "19200", "2"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    lines = []
+    deadline = time.time() + 12
+    try:
+        while len(lines) < 2 and time.time() < deadline:
+            line = proc.stdout.readline()
+            if line:
+                lines.append(json.loads(line))
+        if len(lines) != 2:
+            stderr = proc.stderr.read() if proc.poll() is not None else ""
+            raise AssertionError(f"expected two stream samples, got {lines!r}; stderr={stderr}")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+        stop_event.set()
+        thread.join(timeout=2)
+        os.close(slave_fd)
+        os.close(master_fd)
+    if errors:
+        raise errors[0]
+    return lines
+
+
+def main():
+    identity_commands = commands_for_identity(IDENTITY)
+    identity = run_case(["--identify", "{DEVICE}", "19200"], identity_commands)
+    assert identity == {
+        "version": "GMC-300Re 4.62",
+        "serial": "abc1234def0",
+        "serial_full": "ab0c012304def0",
+        "baud": 19200,
+        "has_temp": False,
+        "has_gyro": False,
+    }, identity
+
+    core_commands = [
+        (HEARTBEAT, b""),
+        (b"<GETCPM>>", CORE_SAMPLE[b"<GETCPM>>"]),
+        (b"<GETVOLT>>", CORE_SAMPLE[b"<GETVOLT>>"]),
+    ]
+    core = run_case(["--sample", "{DEVICE}", "19200", "0"], core_commands)
+    assert core == {
+        "cpm": 18,
+        "volt": 4.0,
+        "temp": None,
+        "x": None,
+        "y": None,
+        "z": None,
+    }, core
+
+    diag_commands = [
+        (HEARTBEAT, b""),
+        (b"<GETCPM>>", DIAG_SAMPLE[b"<GETCPM>>"]),
+        (b"<GETVOLT>>", DIAG_SAMPLE[b"<GETVOLT>>"]),
+        (b"<GETTEMP>>", DIAG_SAMPLE[b"<GETTEMP>>"]),
+        (b"<GETGYRO>>", DIAG_SAMPLE[b"<GETGYRO>>"]),
+    ]
+    diag = run_case(["--sample", "{DEVICE}", "57600", "1"], diag_commands)
+    assert diag == {
+        "cpm": 18,
+        "volt": 4.0,
+        "temp": 25.3,
+        "x": 1,
+        "y": 2,
+        "z": 3,
+    }, diag
+
+    high_commands = [
+        (HEARTBEAT, b""),
+        (b"<GETCPM>>", bytes([0xC5, 0x74])),
+        (b"<GETVOLT>>", CORE_SAMPLE[b"<GETVOLT>>"]),
+    ]
+    high = run_case(["--sample", "{DEVICE}", "115200", "0"], high_commands)
+    assert high["cpm"] == 50548, high
+
+    # Delayed stale bytes after HEARTBEAT0 must be drained before GETCPM.
+    quiet = run_case(
+        ["--sample", "{DEVICE}", "19200", "0"],
+        core_commands,
+        heartbeat_tail=bytes([0x34, 0x2E]),
+    )
+    assert quiet["cpm"] == 18, quiet
+
+    # Persistent mode keeps one serial session open: identity once, then two
+    # samples without another HEARTBEAT0 or GETSERIAL transaction.
+    streamed = run_stream_two_samples(heartbeat_tail=bytes([0x34, 0x2E]))
+    assert [row["cpm"] for row in streamed] == [18, 19], streamed
+    assert all(row["serial"] == "abc1234def0" for row in streamed)
+    assert all(row["temp"] is None for row in streamed)
+
+    proc = subprocess.run(
+        [BINARY, "--identify", "/dev/null", "12345"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+
+    print("protocol tests passed")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"TEST FAILURE: {exc}", file=sys.stderr)
+        raise
+'''
+
+          files['README.md'] = r'''# GMC3xx Radiation Monitor for Home Assistant
+
+A Home Assistant app (formerly called an add-on) for reliable monitoring of GQ GMC Geiger counters over the legacy **GQ-RFC1201** serial protocol, with MQTT publishing and automatic recovery.
+
+This repository is a compatibility fork of [`gi1mic/gmc320`](https://github.com/gi1mic/gmc320). The app keeps the original MQTT topic/payload contract where practical while making the serial transport fail closed: incomplete or stale bytes are never accepted merely because they form a plausible CPM number.
+
+![GMC3xx Radiation Monitor logo](gmc3xx_fixed/logo.png)
+
+## Why this project exists
+
+The original reader performs a single `read()` for each expected serial response and does not verify that the requested number of bytes was actually returned. POSIX serial reads may return fewer bytes than requested. Leftover bytes can then cross a command boundary and be decoded as a different measurement.
+
+That is especially dangerous for `GETCPM`: two unrelated bytes can form a mathematically valid but completely false 16-bit CPM value. This project fixes the transport layer rather than hiding high readings with an arbitrary numerical ceiling. A genuinely high, correctly framed CPM value is still published.
+
+## Supported scope
+
+The target is the older GQ family using RFC1201-style **two-byte `GETCPM`** responses, including the GMC-280, GMC-300, GMC-300E, GMC-300E Plus / GMC-300E+, GMC-320 and GMC-320 Plus / GMC-320+ when their firmware implements the documented RFC1201 command shapes.
+
+Compatibility is protocol-based rather than name-based: the counter must provide the expected `GETVER`, `GETSERIAL`, `GETCPM` and `GETVOLT` responses. GMC-320-only temperature/gyroscope commands are sent only to identified GMC-320-family firmware.
+
+### Not supported
+
+GMC-500/500+/600/600+ use GQ-RFC1801, where `GETCPM` is four bytes and other response formats differ. GMC-800 and newer/different protocol families are also outside the current scope unless explicitly implemented and tested in a future release.
+
+## Reliability design
+
+Version 1.2 keeps one serial connection open for normal operation. Heartbeat is disabled once, the line is allowed to become quiet, identity is read once, and polling continues on that same session. A persistent serial failure causes the session to close and the app automatically reconnects and re-identifies the counter.
+
+Other safeguards include exact-length reads, bounded timeouts, stale-input flushing, retries, safe high-CPM pass-through, automatic MQTT credential refresh when using Home Assistant's MQTT service, and bounded MQTT publish timeouts. There is no numerical spike filter.
+
+## Installation
+
+1. In Home Assistant open **Settings → Apps → App store** (older UI: **Settings → Add-ons → Add-on Store**).
+2. Add the repository `https://github.com/ArrowSK/ha-gmc3xx-fixed`.
+3. Refresh the store and install **GMC3xx Radiation Monitor**.
+4. Select the serial device. Prefer a stable `/dev/serial/by-id/...` path when Home Assistant offers one.
+5. Leave `baud` as `auto` unless you already know the counter's configured baud.
+6. For the simplest Home Assistant MQTT setup, leave `mqtt_server` blank. The app will use the MQTT service exposed to Home Assistant apps. For an external broker, fill the manual MQTT fields instead.
+7. If migrating from another GMC serial reader, **stop the old reader before starting this one**. Two processes must never own the same serial device simultaneously.
+8. Start the app and confirm a normal CPM value is updating.
+
+Full setup, migration and troubleshooting instructions are in [`gmc3xx_fixed/DOCS.md`](gmc3xx_fixed/DOCS.md).
+
+## MQTT compatibility
+
+The measurement topic remains:
+
+```text
+homeassistant/sensor/gmc3xx_<serial>
+```
+
+Typical 300/300E-family payload:
+
+```json
+{
+  "version": "GMC-300Re 4.xx",
+  "serial": "compatibility-id",
+  "serial_full": "14-digit-hex-id",
+  "baud": 19200,
+  "cpm": 18,
+  "volt": 4.0,
+  "temp": null,
+  "x": null,
+  "y": null,
+  "z": null
+}
+```
+
+The legacy non-zero-padded serial representation is intentionally retained in the topic so existing Home Assistant MQTT entities can continue to work after migration.
+
+## Safety model
+
+This software is a convenience integration, **not a calibrated radiation-safety instrument**. It does not certify dose rate, detector calibration, tube response or regulatory compliance.
+
+Data is rejected because the serial transaction is incomplete or structurally malformed, never because the numerical CPM value looks frightening. Consequential radiation decisions should be confirmed with suitable independent instrumentation.
+
+## Privacy
+
+Do not place MQTT credentials, detector identifiers, private email addresses, Home Assistant tokens, private network addresses or household/location information in this repository or public issues. Runtime credentials are not logged. Detector identifiers and serial-derived MQTT topics are redacted from normal startup logs. Public test fixtures are synthetic, and CI scans repository content for common accidental privacy leaks.
+
+## Maintenance expectations
+
+This is a small best-effort compatibility project, not a commercial support service. The supported protocol scope is intentionally narrow. New device families should be added only from documented protocol behaviour plus reproducible tests, never by guessing packet sizes.
+
+## Commercial-use licensing reality
+
+This repository is derived from GPL-3.0-covered upstream code and therefore remains **GPL-3.0-only**. GPL-compliant commercial use cannot be prohibited by adding a non-commercial restriction to this derivative. The project offers no separate commercial licence, warranty, paid support, endorsement or trademark permission. See [`COMMERCIAL_USE.md`](COMMERCIAL_USE.md).
+
+## Development and tests
+
+CI validates YAML/app metadata, privacy-sensitive repository content, shell syntax and ShellCheck, C compilation with warnings as errors, fragmented serial responses, delayed stale bytes, GMC-300 and GMC-320 paths, correctly framed high CPM values, persistent-session polling, icon assets, and a full Home Assistant app image build.
+
+## Upstream and provenance
+
+Derived from the original Home Assistant add-on [`gi1mic/gmc320`](https://github.com/gi1mic/gmc320) and the GQ-RFC1201 communication protocol published by GQ Electronics. The upstream project is GPL-3.0; this derivative remains GPL-3.0-only. See [`LICENSE`](LICENSE) and [`NOTICE.md`](NOTICE.md).
+
+This project is independent and is not endorsed by GQ Electronics, Home Assistant, or the original repository maintainer.
+'''
+
+          files['gmc3xx_fixed/DOCS.md'] = r'''# GMC3xx Radiation Monitor — setup and operation
+
+## 1. What the app does
+
+The app reads a compatible GQ GMC counter through USB serial and publishes validated measurements to MQTT. It is designed for the RFC1201/two-byte-CPM family. It keeps the serial connection open during normal polling and automatically creates a new session after a persistent serial failure.
+
+The app intentionally does **not** reject a sample merely because CPM is high. Transport validity and protocol structure determine whether data is accepted.
+
+## 2. Supported devices
+
+Current intended scope:
+
+- GMC-280
+- GMC-300
+- GMC-300E
+- GMC-300E Plus / GMC-300E+
+- GMC-320
+- GMC-320 Plus / GMC-320+
+
+The required compatibility is RFC1201 behaviour for `GETVER`, `GETSERIAL`, `GETCPM` and `GETVOLT`. Temperature and gyroscope polling is enabled only when the identified version starts with `GMC-320`.
+
+GMC-500/500+/600/600+ use RFC1801 and are not supported by this app. GMC-800 and other protocol families are outside the current scope.
+
+## 3. Install from the repository
+
+1. In Home Assistant open **Settings → Apps → App store**. On older Home Assistant versions this may still be labelled **Add-ons → Add-on Store**.
+2. Open the repository menu and add:
+
+   `https://github.com/ArrowSK/ha-gmc3xx-fixed`
+
+3. Refresh the store.
+4. Install **GMC3xx Radiation Monitor**.
+5. Do not start it yet if another application is currently using the same Geiger counter serial port.
+
+## 4. Serial configuration
+
+### `port`
+
+Select the USB serial device used by the counter. A stable path under `/dev/serial/by-id/` is strongly preferred when available because it survives ordinary `/dev/ttyUSB0` → `/dev/ttyUSB1` renumbering.
+
+Only one program may own the serial connection. Stop any previous GMC reader before starting this app.
+
+### `baud`
+
+Default: `auto`.
+
+Automatic detection probes documented legacy rates using the read-only `GETVER` command. The app sends `HEARTBEAT0` only after a valid GMC identity has identified the correct baud, avoiding state-changing commands at incorrect baud rates.
+
+If you already know the configured baud, setting it explicitly gives the fastest and most deterministic startup. Examples include `19200`, `57600` and `115200` where supported by the counter firmware.
+
+### `repeat`
+
+Polling interval in seconds. Default: `5`. Valid range: 2–3600 seconds.
+
+The interval does not reopen the serial port. Version 1.2 keeps one persistent serial session and polls inside it.
+
+## 5. MQTT configuration
+
+### Recommended Home Assistant setup
+
+Leave `mqtt_server` empty. The app requests the Home Assistant MQTT service and uses the connection details supplied to apps at runtime. Credentials are never written to the repository or printed in logs.
+
+If the MQTT service restarts or its connection details change, a failed publish causes the app to refresh the service details automatically and retry.
+
+### Manual or external MQTT broker
+
+Set `mqtt_server` to the broker hostname/IP. When this field is non-empty, manual settings take precedence for backwards compatibility:
+
+- `mqtt_server`
+- `mqtt_port`
+- `mqtt_user`
+- `mqtt_password`
+
+Never include real credentials in a public issue or screenshot.
+
+## 6. First start
+
+A normal startup looks broadly like this:
+
+```text
+INFO: Starting GMC3xx Radiation Monitor
+INFO: Serial device: /dev/serial/by-id/...
+INFO: Baud setting: auto
+INFO: Polling interval: 5s
+INFO: Detected device family: GMC-...
+INFO: Active serial baud: ...
+INFO: Persistent serial session established
+INFO: MQTT topic derived from detector serial (identifier redacted from log)
+```
+
+Normal successful samples are intentionally quiet; the log is not filled every five seconds.
+
+## 7. MQTT payload
+
+Topic:
+
+```text
+homeassistant/sensor/gmc3xx_<serial>
+```
+
+Payload fields:
+
+- `version` — device/firmware identity string
+- `serial` — legacy compatibility identifier used in the MQTT topic
+- `serial_full` — canonical zero-padded hexadecimal representation
+- `baud` — active serial rate
+- `cpm` — counts per minute
+- `volt` — counter voltage field from RFC1201
+- `temp`, `x`, `y`, `z` — populated only on supported GMC-320 firmware; otherwise `null`
+
+## 8. Home Assistant MQTT sensor example
+
+The app preserves the original topic contract and does not force MQTT Discovery on existing installations. If you are creating entities manually, use your actual topic suffix locally; do not publish a detector identifier in a public issue.
+
+```yaml
+mqtt:
+  sensor:
+    - name: "GMC3xx.cpm"
+      state_topic: "homeassistant/sensor/gmc3xx_YOUR_LOCAL_TOPIC_SUFFIX"
+      unique_id: gmc3xx_cpm
+      unit_of_measurement: "CPM"
+      state_class: measurement
+      expire_after: 300
+      value_template: "{{ value_json.cpm }}"
+
+    - name: "GMC3xx.voltage"
+      state_topic: "homeassistant/sensor/gmc3xx_YOUR_LOCAL_TOPIC_SUFFIX"
+      unique_id: gmc3xx_voltage
+      unit_of_measurement: "V"
+      device_class: voltage
+      state_class: measurement
+      expire_after: 300
+      value_template: "{{ value_json.volt }}"
+```
+
+A dose-rate conversion depends on the detector/tube calibration chosen for your installation. The app deliberately publishes CPM rather than imposing a universal µSv/h conversion factor.
+
+## 9. Migration from another GMC reader
+
+1. Record the existing MQTT topic and Home Assistant entity behaviour.
+2. Install and configure this app but leave it stopped.
+3. Stop the old serial reader.
+4. Start this app.
+5. Confirm that CPM updates on the existing MQTT topic.
+6. Leave the old reader installed but stopped until you are satisfied with the migration.
+7. If you have a Home Assistant automation that restarts the old app, update or disable it so two readers can never compete for the USB port.
+
+The legacy serial formatting in the MQTT topic is preserved specifically to make this cutover possible without redesigning existing Home Assistant entities.
+
+## 10. Automatic recovery behaviour
+
+The app is designed to recover without manual intervention from ordinary transient failures:
+
+- incomplete serial reads are retried and never decoded partially;
+- persistent serial failure closes the session and triggers automatic reconnect/re-identification;
+- USB disappearance is waited out until the configured device path returns;
+- MQTT publish operations are time-bounded;
+- Home Assistant MQTT service details are refreshed automatically after a publish failure;
+- the app is configured to start automatically with Home Assistant Supervisor.
+
+A stable `/dev/serial/by-id/...` path is the key to reliable USB unplug/replug recovery.
+
+## 11. Why 300-family temperature/gyro values are `null`
+
+RFC1201 documents `GETTEMP` and `GETGYRO` support for the relevant GMC-320 firmware path. Sending those commands indiscriminately to 280/300/300E-family devices adds serial traffic that is not required for CPM monitoring and can increase framing risk. Therefore the fields stay present for payload compatibility but are `null` outside the supported 320 path.
+
+## 12. Troubleshooting
+
+### `Serial device is not present`
+
+Check that the counter is connected and that the configured `port` still exists. Prefer the by-id path if available.
+
+### `no RFC1201-compatible GMC identity found`
+
+Verify the model is in the supported protocol family. Try an explicit known baud if auto detection is inconclusive. Do not guess protocol compatibility for 500/600/800-family units.
+
+### `incomplete response ... retrying`
+
+One incomplete transaction is safely retried. If all retries fail, the persistent session is discarded and recreated. No partial bytes are published as CPM.
+
+### `MQTT publish failed`
+
+If `mqtt_server` is blank, verify an MQTT service/broker is available to Home Assistant. If using manual MQTT, verify host, port and credentials locally. Do not paste passwords into an issue.
+
+### Existing CPM entity becomes unavailable after migration
+
+Confirm the old and new readers are not running simultaneously. Then verify the new app reached `Persistent serial session established`. The serial-derived topic is intentionally redacted from logs, so inspect the MQTT broker or your local Home Assistant entity configuration rather than posting the identifier publicly.
+
+## 13. Privacy and bug reports
+
+Before posting logs, remove detector identifiers, MQTT topics containing those identifiers, credentials, private email addresses, private IP addresses, hostnames, precise location/household information and Home Assistant tokens. The app itself redacts detector identifiers from normal logs.
+
+## 14. Safety
+
+This app improves data transport integrity; it does not calibrate the Geiger counter. It is not a substitute for certified radiation measurement equipment. High correctly framed CPM values are intentionally allowed through unchanged.
+'''
+
+          files['gmc3xx_fixed/README.md'] = r'''# GMC3xx Radiation Monitor
+
+Reliable RFC1201 serial-to-MQTT monitoring for compatible GQ GMC Geiger counters in Home Assistant.
+
+Key properties:
+
+- exact-length serial framing with retries and bounded timeouts;
+- persistent USB serial session during normal polling;
+- automatic reconnect and re-identification after persistent serial failure;
+- post-heartbeat quiet/drain handling to prevent stale bytes crossing a command boundary;
+- GMC-320-only diagnostic commands are never sent to 280/300/300E-family units;
+- no arbitrary high-CPM filter;
+- original MQTT topic compatibility retained;
+- automatic use of Home Assistant's MQTT service when `mqtt_server` is left blank;
+- manual/external MQTT remains available for backwards compatibility.
+
+For installation, migration, Home Assistant MQTT examples and troubleshooting, see [DOCS.md](DOCS.md).
+
+This app is a GPL-3.0-only derivative of `gi1mic/gmc320` and is not a calibrated radiation-safety instrument.
+'''
+
+          files['gmc3xx_fixed/translations/en.yaml'] = r'''configuration:
+  port:
+    name: Serial device
+    description: Select the GMC counter USB serial device. Prefer a stable /dev/serial/by-id path when available.
+  baud:
+    name: Serial baud
+    description: Use auto to detect a documented legacy RFC1201 rate, or enter a known fixed baud for faster startup.
+  mqtt_server:
+    name: MQTT server override
+    description: Leave blank to use Home Assistant's MQTT service automatically. Set a host only for a manual or external broker.
+  mqtt_port:
+    name: MQTT port
+    description: Port used when mqtt_server is set manually.
+  mqtt_user:
+    name: MQTT username
+    description: Username used only for a manually configured MQTT broker.
+  mqtt_password:
+    name: MQTT password
+    description: Password used only for a manually configured MQTT broker. It is never written to logs.
+  repeat:
+    name: Polling interval
+    description: Seconds between samples. The serial connection remains open between polls.
+'''
+
+          files['repository.yaml'] = r'''name: "GMC3xx Radiation Monitor"
+url: "https://github.com/ArrowSK/ha-gmc3xx-fixed"
+maintainer: "ArrowSK"
+'''
+
+          files['gmc3xx_fixed/CHANGELOG.md'] = r'''# Changelog
+
+## 1.2.0 — 2026-08-12
+
+- Renamed the visible app branding to **GMC3xx Radiation Monitor** while retaining the existing repository URL and internal app slug for upgrade compatibility.
+- Added persistent serial streaming: the counter is opened, heartbeat-disabled and identified once per session instead of reopening the USB port for every sample.
+- Added automatic session recovery: after bounded transaction retries are exhausted, the serial session closes and the app reconnects/re-identifies automatically.
+- Improved baud auto-detection so wrong-rate probing uses only the read-only `GETVER` command; `HEARTBEAT0` is sent only after a valid GMC response identifies a candidate baud.
+- Replaced the fixed post-heartbeat delay with a bounded quiet-drain phase that waits for 500 ms of serial silence and discards late in-flight bytes before framed polling starts.
+- Added Home Assistant MQTT service support. New installations can leave `mqtt_server` blank; existing explicit manual broker settings continue to take precedence.
+- Added automatic MQTT service-detail refresh after publish failures and a bounded publish timeout.
+- Added persistent-session regression tests proving identity/heartbeat setup occurs once while multiple CPM samples use the same serial session.
+- Expanded installation, migration, privacy, recovery and troubleshooting documentation.
+- Added professional app icon/logo assets.
+- No numerical CPM ceiling or spike filter was added.
+
+## 1.1.2 — 2026-08-12
+
+- Restored a 500 ms post-`HEARTBEAT0` settle period before the first polling command for GMC-300-series firmware timing.
+- Added a pseudo-terminal regression condition with delayed stale bytes after `HEARTBEAT0`.
+- No numerical CPM ceiling or spike filter was added.
+
+## 1.1.1 — 2026-08-12
+
+- Added the Home Assistant `init: false` app configuration required by the current s6-overlay base image.
+
+## 1.1.0 — 2026-08-12
+
+- Expanded the intended compatibility scope to the GQ RFC1201/two-byte-CPM family: GMC-280, GMC-300, GMC-300E, GMC-300E Plus, GMC-320 and GMC-320 Plus, subject to firmware command support.
+- Added automatic detection of documented legacy baud rates and a fixed-baud override.
+- Stopped issuing GMC-320-only `GETTEMP`/`GETGYRO` commands to 280/300/300E-family units; optional diagnostic fields remain present as `null`.
+- Added validation of documented temperature/gyroscope terminators on the GMC-320 path.
+- Added `baud` to MQTT payload metadata and redacted detector identifiers from normal startup logs.
+- Added explicit RFC1801/four-byte-CPM exclusion.
+- Expanded protocol tests, privacy scanning/documentation and maintenance expectations.
+
+## 1.0.0 — 2026-08-12
+
+- Initial public compatibility fork of `gi1mic/gmc320`.
+- Added exact-length serial reads that tolerate fragmented POSIX reads.
+- Added stale-input flushing and retry/fail-closed handling around serial transactions.
+- Separated identity reads from recurring sample polling.
+- Preserved legacy MQTT topic/serial formatting and added canonical `serial_full` metadata.
+- Added MQTT publish timeout handling, pseudo-terminal regression tests and CI validation.
+- Kept correctly framed high CPM values unfiltered.
+'''
+
+          # A clean vector source is committed for maintainability; PNGs used by
+          # the Home Assistant app store are rendered below.
+          files['gmc3xx_fixed/icon.svg'] = r'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#092641"/><stop offset="1" stop-color="#0d4f75"/></linearGradient>
+  <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#39d8ff"/><stop offset="1" stop-color="#1396d6"/></linearGradient>
+</defs>
+<rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bg)" stroke="url(#edge)" stroke-width="10"/>
+<path d="M26 171h32l15-33 24 65 25-102 24 73 14-30h70" fill="none" stroke="#55ddff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+<g transform="translate(142 74)">
+  <circle r="49" fill="#f5ca21" stroke="#101820" stroke-width="6"/>
+  <circle r="9" fill="#101820"/>
+  <path d="M0-12C-13-12-25-8-35-1l-12-21A55 55 0 0 1-9-35Z" fill="#101820"/>
+  <path d="M10 7c7 11 16 19 27 24l-12 21A55 55 0 0 1-8 25Z" fill="#101820"/>
+  <path d="M-10 7c-7 11-16 19-27 24l12 21A55 55 0 0 0 8 25Z" fill="#101820"/>
+</g>
+<rect x="48" y="43" width="73" height="113" rx="18" fill="#17222d" stroke="#d5e9f4" stroke-width="5" transform="rotate(-8 84 100)"/>
+<rect x="59" y="60" width="50" height="49" rx="6" fill="#a9e47e" stroke="#101820" stroke-width="3" transform="rotate(-8 84 85)"/>
+<path d="M67 80h32M65 91h29" stroke="#18331c" stroke-width="5" stroke-linecap="round" transform="rotate(-8 84 85)"/>
+<circle cx="87" cy="132" r="11" fill="#243848" stroke="#7aa8bf" stroke-width="3"/>
+</svg>
+'''
+
+          files['gmc3xx_fixed/logo.svg'] = r'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 160">
+<rect width="640" height="160" rx="30" fill="#092641"/>
+<g transform="translate(16 16) scale(.5)">
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="#0d4f75" stroke="#39d8ff" stroke-width="10"/>
+  <path d="M26 171h32l15-33 24 65 25-102 24 73 14-30h70" fill="none" stroke="#55ddff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="174" cy="74" r="49" fill="#f5ca21" stroke="#101820" stroke-width="6"/>
+  <circle cx="174" cy="74" r="9" fill="#101820"/>
+  <path d="M174 62c-13 0-25 4-35 11l-12-21a55 55 0 0 1 38-13Z" fill="#101820"/>
+  <path d="M184 81c7 11 16 19 27 24l-12 21a55 55 0 0 1-33-27Z" fill="#101820"/>
+  <path d="M164 81c-7 11-16 19-27 24l12 21a55 55 0 0 0 33-27Z" fill="#101820"/>
+  <rect x="48" y="43" width="73" height="113" rx="18" fill="#17222d" stroke="#d5e9f4" stroke-width="5" transform="rotate(-8 84 100)"/>
+  <rect x="59" y="60" width="50" height="49" rx="6" fill="#a9e47e" stroke="#101820" stroke-width="3" transform="rotate(-8 84 85)"/>
+  <circle cx="87" cy="132" r="11" fill="#243848" stroke="#7aa8bf" stroke-width="3"/>
+</g>
+<text x="170" y="71" fill="#ffffff" font-family="DejaVu Sans, sans-serif" font-size="43" font-weight="700">GMC3xx</text>
+<text x="170" y="116" fill="#8edfff" font-family="DejaVu Sans, sans-serif" font-size="30">Radiation Monitor</text>
+</svg>
+'''
+
+          for path, content in files.items():
+              p = Path(path)
+              p.parent.mkdir(parents=True, exist_ok=True)
+              p.write_text(content, encoding='utf-8')
+          PY
+
+      - name: Render Home Assistant icon assets
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq librsvg2-bin
+          rsvg-convert -w 256 -h 256 gmc3xx_fixed/icon.svg -o gmc3xx_fixed/icon.png
+          rsvg-convert -w 640 -h 160 gmc3xx_fixed/logo.svg -o gmc3xx_fixed/logo.png
+
+      - name: Local release validation
+        run: |
+          set -e
+          bash -n gmc3xx_fixed/run.sh
+          gcc -std=c11 -Wall -Wextra -Werror -O2 gmc3xx_fixed/src/gmc320.c -o /tmp/gmc320-test
+          GMC320_BINARY=/tmp/gmc320-test python3 tests/test_protocol.py
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          import yaml
+
+          config = yaml.safe_load(Path('gmc3xx_fixed/config.yaml').read_text())
+          assert config['name'] == 'GMC3xx Radiation Monitor'
+          assert config['version'] == '1.2.0'
+          assert config['slug'] == 'gmc3xx_fixed'
+          assert config['init'] is False
+          assert config['services'] == ['mqtt:want']
+          assert config['options']['mqtt_server'] == ''
+          assert config['options']['repeat'] == 5
+
+          for path, expected in [('gmc3xx_fixed/icon.png', (256, 256)), ('gmc3xx_fixed/logo.png', (640, 160))]:
+              raw = Path(path).read_bytes()
+              assert raw[:8] == b'\x89PNG\r\n\x1a\n'
+              width, height = struct.unpack('>II', raw[16:24])
+              assert (width, height) == expected
+          print('release validation passed')
+          PY
+
+      - name: Commit release update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            README.md repository.yaml \
+            gmc3xx_fixed/config.yaml gmc3xx_fixed/Dockerfile gmc3xx_fixed/run.sh \
+            gmc3xx_fixed/src/gmc320.c gmc3xx_fixed/DOCS.md gmc3xx_fixed/README.md \
+            gmc3xx_fixed/CHANGELOG.md gmc3xx_fixed/translations/en.yaml \
+            gmc3xx_fixed/icon.svg gmc3xx_fixed/icon.png \
+            gmc3xx_fixed/logo.svg gmc3xx_fixed/logo.png \
+            tests/test_protocol.py
+          if git diff --cached --quiet; then
+            echo "No release changes to commit"
+            exit 0
+          fi
+          git commit -m "Release GMC3xx Radiation Monitor 1.2.0"
+          git push origin HEAD:main
