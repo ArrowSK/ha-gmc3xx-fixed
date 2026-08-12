@@ -1,27 +1,23 @@
 # Commercial use and licensing
 
-This repository is a modified derivative of [`gi1mic/gmc320`](https://github.com/gi1mic/gmc320), which is distributed under the GNU General Public License version 3. The derivative code in this repository is therefore distributed under **GPL-3.0-only**.
+**GMC3xx Radiation Monitor** is a derivative of GPL-3.0-covered upstream code from `gi1mic/gmc320` and is therefore distributed as **GPL-3.0-only**.
 
 ## What that means
 
-GPL-3.0 permits commercial use, commercial distribution and charging for copies or support, provided the GPL's conditions are followed. It also prohibits downstream distributors from adding most additional restrictions to the rights granted by the GPL.
+The GNU GPL permits commercial use, sale and commercial redistribution when its licence obligations are followed. Because this repository is a GPL-covered derivative, this project cannot add a valid extra condition saying "non-commercial use only" or otherwise revoke the commercial-use rights the GPL grants recipients.
 
-For that reason, this project **cannot add an enforceable "non-commercial use only" condition** to the GPL-covered code. Doing so would conflict with the upstream licence and would not produce the intended prohibition.
+Accordingly:
 
-## What this project does not grant separately
+- GPL-compliant commercial use is legally permitted by the licence;
+- distributors must comply with the GPL's source/licensing obligations;
+- this project does not offer a separate proprietary/commercial licence;
+- this project does not provide paid support, an SLA, warranty, certification or commercial endorsement;
+- the project name/artwork does not imply endorsement by GQ Electronics, Home Assistant or the upstream maintainer.
 
-This repository does not offer:
+## Why the repository does not contain a non-commercial clause
 
-- a separate proprietary/commercial licence;
-- paid support or an SLA;
-- warranty or fitness-for-purpose assurances;
-- endorsement of commercial products using the code;
-- permission to imply endorsement by the repository owner, GQ Electronics, Home Assistant, or the upstream maintainer.
+Adding a non-commercial-use restriction to this GPL-derived code would conflict with the licence terms governing the upstream work. A repository notice cannot retroactively remove rights already granted under the GPL.
 
-Any commercial user remains responsible for complying with GPL-3.0, preserving required notices/source availability, and independently validating the software for its intended use.
+If a future project required a genuinely non-commercial licence, it would need to be a separate clean-room implementation that does not derive from GPL-covered source code, and recipients of already published GPL versions would still retain the rights granted to those versions.
 
-## Why the repository is not relicensed as non-commercial
-
-A non-commercial source-available licence would be incompatible with the GPL-covered upstream material from which this project is derived. Moreover, versions already distributed under GPL-3.0 cannot retroactively have their granted rights withdrawn from lawful recipients.
-
-Accordingly, the legally accurate position is GPL-3.0-only, not a misleading non-commercial restriction.
+This file is a project licensing explanation, not individual legal advice. The controlling terms for this repository are in `LICENSE`.
