@@ -1,0 +1,212 @@
+name: One-time serial quiescence fix
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Apply and validate targeted 1.1.2 patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source_path = Path('gmc3xx_fixed/src/gmc320.c')
+          source = source_path.read_text()
+          old = '''static int send_no_response(int fd, const char *cmd) {
+              if (flush_input(fd) != 0) {
+                  return -1;
+              }
+              if (write_all(fd, (const uint8_t *)cmd, strlen(cmd)) != 0) {
+                  return -1;
+              }
+              if (tcdrain(fd) != 0) {
+                  return -1;
+              }
+              usleep(50000);
+              return flush_input(fd);
+          }
+          '''
+          new = '''static int send_no_response(int fd, const char *cmd) {
+              if (flush_input(fd) != 0) {
+                  return -1;
+              }
+              if (write_all(fd, (const uint8_t *)cmd, strlen(cmd)) != 0) {
+                  return -1;
+              }
+              if (tcdrain(fd) != 0) {
+                  return -1;
+              }
+
+              /* The upstream reader waited for its 500 ms serial read timeout
+               * while draining after HEARTBEAT0. Some GMC-300-series firmware
+               * needs that quiet period before it reliably accepts the first
+               * polling command. Wait until the line has been quiet for a full
+               * 500 ms, discarding any late heartbeat bytes, but fail closed if
+               * the stream never becomes quiet within two seconds. */
+              const int quiet_ms = 500;
+              const int hard_limit_ms = 2000;
+              const long long hard_deadline = monotonic_ms() + hard_limit_ms;
+              uint8_t discard[64];
+
+              while (true) {
+                  long long now = monotonic_ms();
+                  int hard_remaining = (int)(hard_deadline - now);
+                  if (hard_remaining <= 0) {
+                      fprintf(stderr, "serial: input did not become quiet after %s\\n", cmd);
+                      return -1;
+                  }
+
+                  int wait_ms = hard_remaining < quiet_ms ? hard_remaining : quiet_ms;
+                  struct pollfd pfd = {
+                      .fd = fd,
+                      .events = POLLIN,
+                      .revents = 0,
+                  };
+
+                  int prc = poll(&pfd, 1, wait_ms);
+                  if (prc == 0) {
+                      if (wait_ms == quiet_ms) {
+                          return flush_input(fd);
+                      }
+                      fprintf(stderr, "serial: input did not become quiet after %s\\n", cmd);
+                      return -1;
+                  }
+                  if (prc < 0) {
+                      if (errno == EINTR) {
+                          continue;
+                      }
+                      fprintf(stderr, "serial: poll failed while quiescing after %s: %s\\n",
+                              cmd, strerror(errno));
+                      return -1;
+                  }
+                  if (!(pfd.revents & (POLLIN | POLLHUP))) {
+                      fprintf(stderr, "serial: unexpected poll state while quiescing after %s\\n", cmd);
+                      return -1;
+                  }
+
+                  ssize_t got = read(fd, discard, sizeof(discard));
+                  if (got > 0) {
+                      continue;
+                  }
+                  if (got < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+                      continue;
+                  }
+                  if (got == 0) {
+                      continue;
+                  }
+                  fprintf(stderr, "serial: read failed while quiescing after %s: %s\\n",
+                          cmd, strerror(errno));
+                  return -1;
+              }
+          }
+          '''
+          if source.count(old) != 1:
+              raise SystemExit('expected send_no_response block not found exactly once')
+          source_path.write_text(source.replace(old, new, 1))
+
+          test_path = Path('tests/test_protocol.py')
+          tests = test_path.read_text()
+          tests = tests.replace(
+              'def simulator(master_fd, responses, stop_event):\n',
+              'def simulator(master_fd, responses, stop_event, heartbeat_tail=b""):\n',
+              1,
+          )
+          old_hb = '''                if expected == HEARTBEAT:
+                    continue
+          '''
+          new_hb = '''                if expected == HEARTBEAT:
+                    if heartbeat_tail:
+                        # Simulate bytes that were already in flight when the
+                        # counter accepted HEARTBEAT0. They must be drained
+                        # before the first request/response transaction.
+                        time.sleep(0.10)
+                        for byte in heartbeat_tail:
+                            os.write(master_fd, bytes([byte]))
+                            time.sleep(0.03)
+                    continue
+          '''
+          if tests.count(old_hb) != 1:
+              raise SystemExit('expected heartbeat simulator block not found exactly once')
+          tests = tests.replace(old_hb, new_hb, 1)
+          tests = tests.replace(
+              'def run_case(args, responses):\n',
+              'def run_case(args, responses, heartbeat_tail=b""):\n',
+              1,
+          )
+          old_worker = '            simulator(master_fd, responses, stop_event)\n'
+          new_worker = '            simulator(master_fd, responses, stop_event, heartbeat_tail)\n'
+          if tests.count(old_worker) != 1:
+              raise SystemExit('expected simulator invocation not found exactly once')
+          tests = tests.replace(old_worker, new_worker, 1)
+          anchor = '''    # A correctly framed high 16-bit value must pass unchanged. The safety fix
+    # is transport validation, never an arbitrary numerical ceiling.
+          '''
+          addition = '''    # Late bytes already in flight after HEARTBEAT0 must be drained before
+    # GETCPM. 0x34 0x2e is deliberately chosen because it would decode as the
+    # false 13,358 CPM value seen when ASCII-like stale bytes cross a boundary.
+    quiet = run_case(
+        ["--sample", "{DEVICE}", "19200", "0"],
+        CORE_SAMPLE,
+        heartbeat_tail=bytes([0x34, 0x2E]),
+    )
+    assert quiet["cpm"] == 18, quiet
+
+'''
+          if tests.count(anchor) != 1:
+              raise SystemExit('expected high-CPM test anchor not found exactly once')
+          tests = tests.replace(anchor, addition + anchor, 1)
+          test_path.write_text(tests)
+
+          config_path = Path('gmc3xx_fixed/config.yaml')
+          config = config_path.read_text()
+          if config.count('version: "1.1.1"') != 1:
+              raise SystemExit('expected config version 1.1.1 not found exactly once')
+          config_path.write_text(config.replace('version: "1.1.1"', 'version: "1.1.2"', 1))
+
+          ci_path = Path('.github/workflows/ci.yml')
+          ci = ci_path.read_text()
+          if ci.count('1.1.1') != 2:
+              raise SystemExit(f'expected two CI version references, found {ci.count("1.1.1")}')
+          ci_path.write_text(ci.replace('1.1.1', '1.1.2'))
+
+          changelog_path = Path('gmc3xx_fixed/CHANGELOG.md')
+          changelog = changelog_path.read_text()
+          header = '# Changelog\n\n'
+          if not changelog.startswith(header):
+              raise SystemExit('unexpected changelog header')
+          section = '''## 1.1.2 — 2026-08-12
+
+- Restored the effective post-`HEARTBEAT0` quiet-drain behaviour of the upstream reader: wait for 500 ms of serial silence before the first polling command, with a two-second hard limit.
+- This targets GMC-300-series firmware that can otherwise ignore the first `GETCPM` immediately after opening the port and disabling heartbeat.
+- Added a pseudo-terminal regression case with deliberately delayed stale bytes after `HEARTBEAT0`; those bytes must be discarded and must never become a false CPM value.
+- No numerical CPM ceiling or spike filter was added.
+
+'''
+          changelog_path.write_text(header + section + changelog[len(header):])
+          PY
+
+          grep -q 'version: "1.1.2"' gmc3xx_fixed/config.yaml
+          grep -q 'quiet_ms = 500' gmc3xx_fixed/src/gmc320.c
+          grep -q 'heartbeat_tail=bytes' tests/test_protocol.py
+
+      - name: Remove this one-time workflow and commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/one-time-serial-quiet-fix.yml
+          git add gmc3xx_fixed/src/gmc320.c tests/test_protocol.py gmc3xx_fixed/config.yaml .github/workflows/ci.yml gmc3xx_fixed/CHANGELOG.md
+          git commit -m "Fix GMC-300 post-heartbeat serial quiescence"
+          git push origin HEAD:main
