@@ -20,6 +20,11 @@ jobs:
 
       - name: Apply targeted 1.1.2 patch
         run: |
+          if grep -q 'version: "1.1.2"' gmc3xx_fixed/config.yaml; then
+            echo "1.1.2 patch already applied"
+            exit 0
+          fi
+
           python3 - <<'PY'
           from pathlib import Path
 
@@ -45,12 +50,6 @@ jobs:
               raise SystemExit('expected config version 1.1.1 exactly once')
           config_path.write_text(config.replace('version: "1.1.1"', 'version: "1.1.2"', 1))
 
-          ci_path = Path('.github/workflows/ci.yml')
-          ci = ci_path.read_text()
-          if ci.count('1.1.1') != 2:
-              raise SystemExit(f'expected two CI 1.1.1 references, found {ci.count("1.1.1")}')
-          ci_path.write_text(ci.replace('1.1.1', '1.1.2'))
-
           changelog_path = Path('gmc3xx_fixed/CHANGELOG.md')
           changelog = changelog_path.read_text()
           header = '# Changelog\n\n'
@@ -70,11 +69,8 @@ jobs:
           grep -q 'usleep(500000)' gmc3xx_fixed/src/gmc320.c
           grep -q 'bytes(\[0x34, 0x2E\])' tests/test_protocol.py
 
-      - name: Remove this one-time workflow and commit
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm .github/workflows/one-time-serial-quiet-fix.yml
-          git add gmc3xx_fixed/src/gmc320.c tests/test_protocol.py gmc3xx_fixed/config.yaml .github/workflows/ci.yml gmc3xx_fixed/CHANGELOG.md
+          git add gmc3xx_fixed/src/gmc320.c tests/test_protocol.py gmc3xx_fixed/config.yaml gmc3xx_fixed/CHANGELOG.md
           git commit -m "Fix GMC-300 post-heartbeat serial timing"
           git push origin HEAD:main
