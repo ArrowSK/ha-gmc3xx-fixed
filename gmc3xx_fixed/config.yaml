@@ -1,6 +1,6 @@
 name: "GMC3xx Fixed Radiation Monitor"
 description: "Robust serial-to-MQTT bridge for GQ GMC counters using the legacy RFC1201 protocol"
-version: "1.1.1"
+version: "1.1.2"
 slug: "gmc3xx_fixed"
 url: "https://github.com/ArrowSK/ha-gmc3xx-fixed"
 arch:

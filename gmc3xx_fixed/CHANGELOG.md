@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2 — 2026-08-12
+
+- Restored the effective 500 ms post-`HEARTBEAT0` quiet period used by the upstream reader before the first polling command.
+- This targets GMC-300-series firmware that can otherwise ignore the first `GETCPM` immediately after opening the port and disabling heartbeat.
+- Added a pseudo-terminal regression condition with deliberately delayed stale bytes after `HEARTBEAT0`; those bytes must be discarded and must never become a false CPM value.
+- No numerical CPM ceiling or spike filter was added.
+
 ## 1.1.1 — 2026-08-12
 
 - Fixed Home Assistant startup on current Supervisor/s6-overlay by declaring `init: false`, as required for apps that use the Home Assistant base image with a direct `CMD` script.

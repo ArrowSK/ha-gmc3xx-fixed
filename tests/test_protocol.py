@@ -52,6 +52,10 @@ def simulator(master_fd, responses, stop_event):
                 progressed = True
 
                 if expected == HEARTBEAT:
+                    # Simulate stale bytes already in flight when HEARTBEAT0
+                    # is accepted. They must be drained before GETCPM.
+                    time.sleep(0.10)
+                    os.write(master_fd, bytes([0x34, 0x2E]))
                     continue
 
                 for byte in responses[expected]:

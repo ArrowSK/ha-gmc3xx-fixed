@@ -220,7 +220,11 @@ static int send_no_response(int fd, const char *cmd) {
     if (tcdrain(fd) != 0) {
         return -1;
     }
-    usleep(50000);
+    /* Match the effective quiet period of the upstream VTIME=5 drain.
+     * GMC-300-series firmware can ignore the first polling command if it
+     * follows HEARTBEAT0 too quickly. Wait 500 ms, then discard any bytes
+     * that were already in flight before starting a framed transaction. */
+    usleep(500000);
     return flush_input(fd);
 }
 
