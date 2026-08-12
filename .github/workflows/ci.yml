@@ -147,5 +147,5 @@ jobs:
 
       - name: Check runtime tools in image
         run: |
-          docker run --rm --entrypoint /bin/sh gmc3xx-monitor:test -c 'busybox --list | grep -qx httpd'
+          docker run --rm --entrypoint /bin/sh gmc3xx-monitor:test -c 'command -v socat >/dev/null'
           docker run --rm --entrypoint /bin/sh gmc3xx-monitor:test -c 'gmc320 2>&1 | grep -q -- --stream'
