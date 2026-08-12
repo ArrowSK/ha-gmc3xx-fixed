@@ -107,9 +107,10 @@ jobs:
                   value = match.group(0).lower()
                   if value not in allowed_synthetic_hex:
                       failures.append(f'{path}: device-identifier-like hexadecimal value present')
-              for phrase in forbidden_branding:
-                  if phrase in text:
-                      failures.append(f'{path}: old/undesired wording present: {phrase!r}')
+              if path.as_posix() != '.github/workflows/ci.yml':
+                  for phrase in forbidden_branding:
+                      if phrase in text:
+                          failures.append(f'{path}: old/undesired wording present: {phrase!r}')
 
           if failures:
               print('\n'.join(failures), file=sys.stderr)
