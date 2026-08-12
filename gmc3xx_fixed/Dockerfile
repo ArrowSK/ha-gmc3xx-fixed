@@ -17,6 +17,7 @@ RUN apk add --no-cache \
       coreutils \
       jq \
       mosquitto-clients \
+      socat \
     && apk add --no-cache --virtual .build-deps \
       build-base \
     && mkdir -p /usr/src/gmc3xx
