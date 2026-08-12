@@ -1,6 +1,6 @@
-name: "GMC3xx Fixed Radiation Monitor"
-description: "Robust serial-to-MQTT bridge for GQ GMC counters using the legacy RFC1201 protocol"
-version: "1.1.2"
+name: "GMC3xx Radiation Monitor"
+description: "Reads supported GQ GMC Geiger counters over USB and sends their measurements to MQTT"
+version: "1.2.0"
 slug: "gmc3xx_fixed"
 url: "https://github.com/ArrowSK/ha-gmc3xx-fixed"
 arch:
@@ -8,19 +8,23 @@ arch:
   - amd64
 startup: application
 boot: auto
+stage: stable
 init: false
 uart: true
 host_network: true
+services:
+  - mqtt:want
+watchdog: "tcp://[HOST]:38121"
 options:
-  port: "/dev/ttyUSB0"
+  port: "auto"
   baud: "auto"
-  mqtt_server: "localhost"
+  mqtt_server: ""
   mqtt_port: 1883
   mqtt_user: ""
   mqtt_password: ""
-  repeat: 60
+  repeat: 5
 schema:
-  port: "device(subsystem=tty)"
+  port: str
   baud: str
   mqtt_server: str
   mqtt_port: port

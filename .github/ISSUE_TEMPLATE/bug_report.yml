@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem with the GMC3xx Fixed app.
+description: Report a reproducible problem with GMC3xx Radiation Monitor.
 title: "[Bug]: "
 labels:
   - bug
@@ -37,8 +37,8 @@ body:
   - type: textarea
     id: problem
     attributes:
-      label: Problem description
-      description: What happened, what was expected, and how often it occurs.
+      label: What happened?
+      description: Tell us what you expected, what actually happened, and whether it is repeatable.
     validations:
       required: true
   - type: textarea
