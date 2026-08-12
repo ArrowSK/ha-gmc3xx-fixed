@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 — 2026-08-12
+
+- Fixed Home Assistant startup on current Supervisor/s6-overlay by declaring `init: false`, as required for apps that use the Home Assistant base image with a direct `CMD` script.
+- Added a CI assertion so future releases cannot accidentally omit the required `init: false` setting.
+
 ## 1.1.0 — 2026-08-12
 
 - Expanded the intended compatibility scope to the GQ RFC1201/two-byte-CPM family: GMC-280, GMC-300, GMC-300E, GMC-300E Plus, GMC-320 and GMC-320 Plus, subject to firmware command support.
