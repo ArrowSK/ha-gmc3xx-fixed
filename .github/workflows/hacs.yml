@@ -24,6 +24,10 @@ jobs:
         uses: hacs/action@main
         with:
           category: integration
+          # The repository is currently distributed as a HACS custom repository.
+          # Description/topics are GitHub repository-listing metadata, not runtime
+          # or HACS package requirements, and cannot be managed by this workflow.
+          ignore: topics description
 
   hassfest:
     runs-on: ubuntu-latest
