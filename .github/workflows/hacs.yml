@@ -1,0 +1,36 @@
+name: HACS integration validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Python integration files
+        run: python3 -m compileall -q custom_components/gmc3xx tests/test_hacs_protocol.py
+      - name: Run HACS serial protocol regression tests
+        run: python3 tests/test_hacs_protocol.py
+
+  validate-hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+          # The repository is currently distributed as a HACS custom repository.
+          # Description/topics are GitHub repository-listing metadata, not runtime
+          # or HACS package requirements, and cannot be managed by this workflow.
+          ignore: topics description
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
