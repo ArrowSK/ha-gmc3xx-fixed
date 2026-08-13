@@ -1,0 +1,32 @@
+name: HACS integration validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Python integration files
+        run: python3 -m compileall -q custom_components/gmc3xx tests/test_hacs_protocol.py
+      - name: Run HACS serial protocol regression tests
+        run: python3 tests/test_hacs_protocol.py
+
+  validate-hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master

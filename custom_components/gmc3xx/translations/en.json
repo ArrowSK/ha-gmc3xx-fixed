@@ -1,0 +1,31 @@
+{
+  "title": "GMC3xx Radiation Monitor",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up GMC3xx Radiation Monitor",
+        "description": "This integration talks directly to the USB serial device. Stop the GMC3xx Home Assistant App before continuing. Installing the HACS files alone does not access the device, but running the App and this integration at the same time can corrupt serial replies.",
+        "data": {
+          "app_stopped": "I have stopped the GMC3xx Home Assistant App",
+          "port": "Serial port",
+          "baud": "Baud rate",
+          "scan_interval": "Polling interval (seconds)"
+        },
+        "data_description": {
+          "port": "Use auto to scan /dev/serial/by-id, /dev/ttyUSB and /dev/ttyACM. Enter a device path only for unusual setups.",
+          "baud": "Auto uses the same supported RFC1201 baud-rate search as the companion App.",
+          "scan_interval": "Minimum 2 seconds. The default matches the App."
+        }
+      }
+    },
+    "error": {
+      "app_must_be_stopped": "Stop the GMC3xx Home Assistant App before probing the USB device.",
+      "device_not_found": "No compatible RFC1201 GMC counter was found.",
+      "multiple_devices": "More than one compatible GMC counter was found. Enter one serial device path explicitly.",
+      "cannot_connect": "The serial device could not be identified reliably. Check the cable, device path, baud rate, and that no other program is using it."
+    },
+    "abort": {
+      "already_configured": "This GMC counter is already configured."
+    }
+  }
+}
